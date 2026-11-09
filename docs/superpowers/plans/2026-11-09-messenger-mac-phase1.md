@@ -114,7 +114,7 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 
 - [ ] **Step 1:** Viết test Go: `TestUnknownCmdReturnsError` (response `ok=false`, `error.code="unknown_cmd"`), `TestRequestIDEchoed`, `TestFakeLoginEmitsConnectedThenConversations` (thứ tự: `connection_state=connected`, rồi 2 `conversation_upsert`), `TestMalformedJSONDoesNotPanic`.
 - [ ] **Step 2:** `cd core && go test ./engine/...`. Kỳ vọng: FAIL.
-- [ ] **Step 3:** Cài `protocol.go`, `engine.go` (dispatch chạy trên goroutine, mỗi lệnh một goroutine, `emit` an toàn khi gọi đồng thời), `fake_backend.go`. `capi.go` giữ callback C, chuyển event thành `C.CString` rồi gọi callback. Phía Swift copy chuỗi rồi gọi `core_free`.
+- [ ] **Step 3:** Cài `protocol.go`, `engine.go` (dispatch chạy trên goroutine, mỗi lệnh một goroutine, `emit` an toàn khi gọi đồng thời), `fake_backend.go`. `capi.go` giữ callback C, chuyển event thành `C.CString` rồi gọi callback. Go tự `C.free` chuỗi event sau khi callback trả về. Swift chỉ copy chuỗi trong callback, **không** gọi `core_free` cho event.
 - [ ] **Step 4:** `go test ./engine/... -race`. Kỳ vọng: PASS.
 - [ ] **Step 5:** Viết test Swift `BridgeRoundTripTests.testFakeLoginFlow`: init với `{"backend":"fake"}`, gọi `login`, đợi `events` nhận `connected` và 2 `conversationUpsert` (timeout 2 giây).
 - [ ] **Step 6:** `make core kit-test`. Kỳ vọng: PASS.

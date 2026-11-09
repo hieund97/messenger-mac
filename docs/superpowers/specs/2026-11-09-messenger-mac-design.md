@@ -89,7 +89,7 @@ Ngày: 2026-11-09 · Trạng thái: chờ duyệt
 |---|---|
 | `core_init(config_json, event_cb)` | Đường dẫn data dir, log level. Đăng ký callback nhận sự kiện. |
 | `core_call(request_json) -> request_id` | Lệnh bất đồng bộ. Kết quả trả về qua sự kiện `response` cùng `request_id`. |
-| `core_free(ptr)` | Giải phóng chuỗi Go đã cấp phát. |
+| `core_free(ptr)` | Dự phòng cho chuỗi Go trả ra sau này. Chuỗi event do Go tự giải phóng sau khi callback trả về, Swift không gọi `core_free` cho event. |
 | `core_shutdown()` | Đóng kết nối, flush store. |
 
 - Lệnh: `login(cookies, platform)`, `restore_history(pin)`, `skip_history_restore`, `logout`, `reconnect`, `list_threads(cursor)`, `fetch_messages(thread, before, limit)`, `send_text(thread, text, client_id)`, `send_media(thread, file_path, mime, client_id)`, `mark_read(thread, until_ts)`, `download_media(attachment_ref, dest_path)`.
