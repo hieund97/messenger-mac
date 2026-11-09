@@ -50,37 +50,40 @@ public struct SystemKeychainStore: KeychainStoring {
     }
 }
 
-/// Bí mật của phiên (cookie, `secret_store`) trong Keychain: service `dev.hieund.macchat`, account `<c_user>/<key>`.
+/// Bí mật của phiên (cookie, `secret_store`) trong Keychain: service `dev.hieund.macmess`, account `<c_user>/<key>`.
 public struct SessionStore: Sendable {
-    public static let service = "dev.hieund.macchat"
+    public static let service = "dev.hieund.macmess"
     static let cookiesKey = "cookies"
     private let keychain: any KeychainStoring
+    private let service: String
 
-    public init(keychain: any KeychainStoring = SystemKeychainStore()) {
+    /// `service` mặc định là `dev.hieund.macmess`; chế độ fake dùng service riêng để không đụng dữ liệu thật.
+    public init(keychain: any KeychainStoring = SystemKeychainStore(), service: String = SessionStore.service) {
         self.keychain = keychain
+        self.service = service
     }
 
     private func account(_ cUser: String, _ key: String) -> String { "\(cUser)/\(key)" }
 
     public func saveCookies(_ cookies: [CookieParam], cUser: String) throws {
-        try keychain.set(try JSONEncoder().encode(cookies), service: Self.service, account: account(cUser, Self.cookiesKey))
+        try keychain.set(try JSONEncoder().encode(cookies), service: service, account: account(cUser, Self.cookiesKey))
     }
 
     public func loadCookies(cUser: String) throws -> [CookieParam]? {
-        guard let data = try keychain.get(service: Self.service, account: account(cUser, Self.cookiesKey)) else { return nil }
+        guard let data = try keychain.get(service: service, account: account(cUser, Self.cookiesKey)) else { return nil }
         do { return try JSONDecoder().decode([CookieParam].self, from: data) } catch { throw SessionStoreError.corrupted }
     }
 
     public func deleteCookies(cUser: String) throws {
-        try keychain.delete(service: Self.service, account: account(cUser, Self.cookiesKey))
+        try keychain.delete(service: service, account: account(cUser, Self.cookiesKey))
     }
 
     public func saveSecret(_ value: String, key: String, cUser: String) throws {
-        try keychain.set(Data(value.utf8), service: Self.service, account: account(cUser, key))
+        try keychain.set(Data(value.utf8), service: service, account: account(cUser, key))
     }
 
     public func loadSecret(key: String, cUser: String) throws -> String? {
-        guard let data = try keychain.get(service: Self.service, account: account(cUser, key)) else { return nil }
+        guard let data = try keychain.get(service: service, account: account(cUser, key)) else { return nil }
         return String(data: data, encoding: .utf8)
     }
 }

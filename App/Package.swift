@@ -2,11 +2,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "MacChat",
+    name: "MacMess",
     platforms: [.macOS(.v14)],
     dependencies: [.package(path: "../MessengerKit")],
     targets: [
-        .executableTarget(name: "MacChat",
-                          dependencies: [.product(name: "CoreBridge", package: "MessengerKit")]),
+        .executableTarget(name: "MacMess",
+                          dependencies: [
+                              .product(name: "CoreBridge", package: "MessengerKit"),
+                              .product(name: "AppCore", package: "MessengerKit"),
+                              .product(name: "CookieImport", package: "MessengerKit"),
+                          ]),
     ]
 )

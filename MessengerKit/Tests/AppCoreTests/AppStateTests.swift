@@ -61,6 +61,50 @@ struct AppStateTests {
         #expect(state.conversations.first?.unreadCount == 0)
     }
 
+    @Test func testResumeUsesSavedCookies() async throws {
+        let env = ResumeEnv()
+        defer { env.cleanUp() }
+        // Chưa từng đăng nhập: không resume được.
+        #expect(await env.makeState(MockLink()).resumeSavedSession() == .needsLogin)
+
+        await env.makeState(MockLink()).login(cookies: sessionCookies)
+        #expect(env.lastUserID == "100")
+
+        let link = MockLink()
+        let state = env.makeState(link)
+        #expect(await state.resumeSavedSession() == .resumed)
+        let sent = await link.commands.compactMap { cmd -> [CookieParam]? in
+            if case .login(let cookies, _) = cmd { cookies } else { nil }
+        }
+        #expect(sent.first?.first(where: { $0.name == "xs" })?.value == "xs-old")
+
+        await state.logout()
+        #expect(env.lastUserID == nil)
+        #expect(await env.makeState(MockLink()).resumeSavedSession() == .needsLogin)
+    }
+
+    @Test func testSafeDownloadURLRejectsTraversal() {
+        #expect(safeDownloadResult("../../.ssh/authorized_keys").name == "authorized_keys")
+        #expect(safeDownloadResult("/etc/passwd").name == "passwd")
+        #expect(safeDownloadResult(".hidden").name == "hidden")
+        #expect(safeDownloadResult("a:b\u{1}c.txt").name == "a_b_c.txt")
+        for bad in [nil, "", ".", ".."] {
+            let r = safeDownloadResult(bad)
+            #expect(r.inside && r.name.count == 36)
+        }
+        #expect(safeDownloadResult(String(repeating: "x", count: 300) + ".pdf").name.count <= 200)
+        #expect(safeDownloadResult("a.txt", existing: ["a.txt"]).name == "a (1).txt")
+        #expect(safeDownloadResult("a.txt", existing: ["a.txt", "a (1).txt"]).name == "a (2).txt")
+        #expect(safeDownloadResult("README", existing: ["README"]).name == "README (1)")
+        // Ký tự Cf (U+202E đảo chiều) bị thay.
+        #expect(safeDownloadResult("a\u{202E}b.txt").name == "a_b.txt")
+        // Tên Unicode dài: cắt theo byte, đúng ranh giới ký tự, giữ phần mở rộng.
+        let long = safeDownloadResult(String(repeating: "đ", count: 150) + ".pdf").name
+        #expect(long.utf8.count <= 200 && long.hasSuffix(".pdf") && long.dropLast(4).allSatisfy { $0 == "đ" })
+        let longDup = safeDownloadResult(String(repeating: "界", count: 100) + ".txt", existing: [String(repeating: "界", count: 64) + ".txt"]).name
+        #expect(longDup.utf8.count <= 200)
+    }
+
     @Test func testCookiesUpdatedPersistedToKeychain() async throws {
         let (state, _, keychain) = try await loggedInState()
         #expect(try storedCookies(keychain, cUser: "100")?.first(where: { $0.name == "xs" })?.value == "xs-old")

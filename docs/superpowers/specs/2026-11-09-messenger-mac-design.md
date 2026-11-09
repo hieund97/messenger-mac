@@ -103,7 +103,7 @@ Ngày: 2026-11-09 · Trạng thái: chờ duyệt
 |---|---|
 | `CookieImporter` | Liệt kê trình duyệt/profile đã cài. Đọc SQLite `Cookies`, lấy khóa "<Browser> Safe Storage" từ Keychain, giải mã `v10` (AES-128-CBC, PBKDF2-SHA1 với salt `saltysalt`, 1003 vòng), bỏ 32 byte hash domain ở DB schema mới. Copy file DB ra chỗ tạm trước khi đọc vì trình duyệt đang khóa file. |
 | `CoreBridge` | Bọc C API thành `async` Swift, giải mã sự kiện JSON thành `Codable`. |
-| `LocalStore` | GRDB/SQLite: threads, messages, attachments, contacts. Lưu bền để mở app thấy ngay dữ liệu cũ. Unique key theo message ID để không trùng. |
+| `LocalStore` | GRDB **in-memory**: threads, messages, attachments, contacts, chỉ tồn tại khi app chạy. Không ghi nội dung tin nhắn ra đĩa; mỗi lần mở app tải lại từ server (chat thường qua Lightspeed, chat E2EE qua secure history bằng khóa đã lưu trong Keychain). Unique key theo message ID để không trùng. |
 | `AppState` | Nguồn dữ liệu duy nhất cho UI. Hợp nhất sự kiện từ lõi vào LocalStore. |
 | UI | `NavigationSplitView`: sidebar danh sách hội thoại có ô tìm kiếm, khung chat dạng bubble, ô nhập có nút đính kèm và kéo-thả, xem ảnh lớn bằng Quick Look. |
 | `Notifier` | `UNUserNotificationCenter`. Không bắn thông báo khi đang xem đúng hội thoại đó, không bắn cho tin do mình gửi hoặc tin từ backfill. |
@@ -136,9 +136,16 @@ Ngày: 2026-11-09 · Trạng thái: chờ duyệt
 | Gửi trùng/mất tin | `client_id` cố định khi retry, trạng thái `unknown` hiển thị rõ, không tự retry. |
 | Rate limit/checkpoint | Backfill có độ trễ giữa các batch, chỉ tải lịch sử khi người dùng cuộn lên. |
 
+## Lưu trữ trên máy (người dùng chốt 2026-11-09)
+
+- Nội dung tin nhắn, danh sách hội thoại, thông tin attachment: chỉ trong bộ nhớ, mất khi thoát app.
+- Ghi ra đĩa chỉ gồm: `e2ee.db` (khóa thiết bị E2EE, bắt buộc để không phải đăng ký thiết bị mới mỗi lần), `core.log` (chỉ lỗi), cookie và bí mật secure history trong Keychain.
+- File nhận chỉ ghi ra `~/Downloads` khi người dùng bấm tải. Thumbnail chỉ cache trong bộ nhớ.
+- Hệ quả đã báo người dùng: bỏ qua PIN thì mỗi lần mở app các chat E2EE trống tới khi có tin mới; tin đang gửi dở khi thoát app mất trạng thái.
+
 ## Phần để builder tự quyết
 
-- Tên app, icon (không dùng tên/logo Messenger hay Meta).
+- Icon (không dùng logo Messenger hay Meta). Tên app đã chốt: **MacMess** (bundle id `dev.hieund.macmess`).
 - Cấu trúc thư mục, cách build Go trong Xcode (Run Script hoặc Makefile).
 - Chi tiết schema GRDB, cách phân trang UI.
 - Mức log, vị trí file log.
@@ -147,7 +154,7 @@ Ngày: 2026-11-09 · Trạng thái: chờ duyệt
 ## Các lựa chọn do Claude đề xuất (người dùng chưa trực tiếp quyết)
 
 - macOS 14 trở lên.
-- GRDB cho LocalStore.
+- GRDB in-memory cho LocalStore.
 - Lưu cookie trong Keychain của app.
 - Ký bằng chứng chỉ tự ký thay vì ad-hoc.
 - Appcast đặt trên GitHub Releases.

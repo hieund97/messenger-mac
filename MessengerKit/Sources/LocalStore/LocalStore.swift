@@ -13,28 +13,17 @@ public struct MessageChange: Sendable, Equatable {
     }
 }
 
-/// Kho cục bộ (`app.db`). File thật dùng DatabasePool, ":memory:" dùng DatabaseQueue.
+/// Kho tin nhắn chỉ nằm trong bộ nhớ (DatabaseQueue in-memory): tin nhắn không bao giờ được ghi ra đĩa.
+/// Vì không có dữ liệu sống qua lần khởi động nên không cần xử lý tin `sending` còn sót khi mở lại.
 /// Mọi API đọc/ghi là async, chạy ngoài main actor.
 public final class LocalStore: Sendable {
     /// id của tin optimistic chưa có id thật.
     public static let optimisticPrefix = "local-"
     private let writer: any DatabaseWriter
 
-    /// `path` là file SQLite, hoặc ":memory:" cho DB tạm.
-    /// Mở DB là thao tác đồng bộ: gọi ngoài main actor.
-    public init(path: String) throws {
-        if path == ":memory:" {
-            writer = try DatabaseQueue()
-        } else {
-            let dir = (path as NSString).deletingLastPathComponent
-            if !dir.isEmpty { try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) }
-            writer = try DatabasePool(path: path)
-        }
+    public init() throws {
+        writer = try DatabaseQueue()
         try Schema.migrator().migrate(writer)
-        // Tin đang gửi mà app thoát giữa chừng: không biết đã tới lõi chưa → unknown, người dùng quyết định gửi lại.
-        try writer.write { db in
-            try db.execute(sql: "UPDATE message SET status = 'unknown' WHERE status = 'sending'")
-        }
     }
 
     public func close() throws { try writer.close() }

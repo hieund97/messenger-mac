@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-let bridgeLogger = Logger(subsystem: "dev.hieund.macchat", category: "core-bridge")
+let bridgeLogger = Logger(subsystem: "dev.hieund.macmess", category: "core-bridge")
 
 /// JSON thô dùng cho args/data của giao thức.
 public enum JSONValue: Codable, Sendable, Equatable {

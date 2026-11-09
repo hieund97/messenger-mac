@@ -6,12 +6,12 @@ cd "$ROOT"
 BINS=()
 for ARCH in arm64 x86_64; do
     swift build --package-path App -c release --triple "$ARCH-apple-macosx14.0"
-    BINS+=("$(swift build --package-path App -c release --triple "$ARCH-apple-macosx14.0" --show-bin-path)/MacChat")
+    BINS+=("$(swift build --package-path App -c release --triple "$ARCH-apple-macosx14.0" --show-bin-path)/MacMess")
 done
-APP="build/MacChat.app"
+APP="build/MacMess.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
-lipo -create "${BINS[@]}" -output "$APP/Contents/MacOS/MacChat"
+lipo -create "${BINS[@]}" -output "$APP/Contents/MacOS/MacMess"
 cp App/Resources/Info.plist "$APP/Contents/Info.plist"
 codesign --force -s - "$APP"
 echo "Built $APP"

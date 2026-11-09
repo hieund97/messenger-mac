@@ -61,10 +61,10 @@ let sessionCookies = [
 @MainActor
 func loggedInState(keychain: MemoryKeychain = MemoryKeychain()) async throws -> (AppState, MockLink, MemoryKeychain) {
     let link = MockLink()
-    let state = AppState(storeFactory: { _ in try LocalStore(path: ":memory:") },
+    let state = AppState(storeFactory: { _ in try LocalStore() },
                          session: SessionStore(keychain: keychain),
                          backend: "fake",
-                         dataDir: FileManager.default.temporaryDirectory.appendingPathComponent("macchat-test"),
+                         dataDir: FileManager.default.temporaryDirectory.appendingPathComponent("macmess-test"),
                          bridgeFactory: { _ in link })
     await state.login(cookies: sessionCookies)
     return (state, link, keychain)
@@ -76,7 +76,7 @@ func storedCookies(_ keychain: MemoryKeychain, cUser: String) throws -> [CookieP
 
 /// Tạo file tạm có `bytes` byte (sparse).
 func makeTempFile(bytes: Int) throws -> URL {
-    let url = FileManager.default.temporaryDirectory.appendingPathComponent("macchat-\(UUID().uuidString).bin")
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("macmess-\(UUID().uuidString).bin")
     FileManager.default.createFile(atPath: url.path, contents: nil)
     try resizeFile(url, to: bytes)
     return url
@@ -86,4 +86,37 @@ func resizeFile(_ url: URL, to bytes: Int) throws {
     let h = try FileHandle(forWritingTo: url)
     defer { try? h.close() }
     try h.truncate(atOffset: UInt64(bytes))
+}
+
+/// Môi trường cho test resume: UserDefaults riêng + Keychain dùng chung giữa các AppState.
+@MainActor
+struct ResumeEnv {
+    let suite = "macmess-test-\(UUID().uuidString)"
+    let keychain = MemoryKeychain()
+    var defaults: UserDefaults { UserDefaults(suiteName: suite)! }
+    var lastUserID: String? { defaults.string(forKey: "lastUserID") }
+
+    func makeState(_ link: MockLink) -> AppState {
+        AppState(storeFactory: { _ in try LocalStore() }, session: SessionStore(keychain: keychain),
+                 backend: "fake", defaults: defaults,
+                 dataDir: FileManager.default.temporaryDirectory.appendingPathComponent("macmess-test"),
+                 bridgeFactory: { _ in link })
+    }
+
+    func cleanUp() { defaults.removePersistentDomain(forName: suite) }
+}
+
+/// Chuyển một file tạm vào thư mục tạm bằng `moveWithUniqueName`, `existing` là các file tạo sẵn.
+/// Trả về tên file đích và cờ "nằm trong dir".
+func safeDownloadResult(_ filename: String?, existing: [String] = []) -> (name: String, inside: Bool) {
+    let fm = FileManager.default
+    let dir = fm.temporaryDirectory.appendingPathComponent("macmess-dl-\(UUID().uuidString)")
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: dir) }
+    for e in existing { fm.createFile(atPath: dir.appendingPathComponent(e).path, contents: nil) }
+    let src = fm.temporaryDirectory.appendingPathComponent("macmess-src-\(UUID().uuidString)")
+    fm.createFile(atPath: src.path, contents: Data("x".utf8))
+    defer { try? fm.removeItem(at: src) }
+    guard let url = try? moveWithUniqueName(from: src, toDirectory: dir, filename: filename) else { return ("", false) }
+    return (url.lastPathComponent, url.deletingLastPathComponent().standardizedFileURL == dir.standardizedFileURL)
 }

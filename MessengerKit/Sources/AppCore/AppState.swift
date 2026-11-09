@@ -45,12 +45,19 @@ public final class AppState {
     @ObservationIgnored private let session: SessionStore
     @ObservationIgnored private let importer: CookieImporter
     @ObservationIgnored private let backend: String
+    @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let dataDir: URL
     @ObservationIgnored private let bridgeFactory: @Sendable (CoreConfig) throws -> any CoreLink
     @ObservationIgnored private var link: (any CoreLink)?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
     @ObservationIgnored private var cUser: String?
-    @ObservationIgnored private var loggingIn = false
+    /// Đang chạy import/login (UI dùng để không nhảy màn hình giữa chừng).
+    public private(set) var isLoggingIn = false
+    /// Đã đăng nhập vào lõi (có phiên đang chạy).
+    public private(set) var isLoggedIn = false
+    @ObservationIgnored private var exhausted: Set<String> = []
+    @ObservationIgnored private var downloading: Set<String> = []
+    @ObservationIgnored private var downloaded: [String: URL] = [:]
     @ObservationIgnored private var loadingOlder: Set<String> = []
     @ObservationIgnored private var lastOlderAt: [String: ContinuousClock.Instant] = [:]
     @ObservationIgnored private var observers: [UUID: AsyncStream<CoreEvent>.Continuation] = [:]
@@ -58,22 +65,43 @@ public final class AppState {
     @ObservationIgnored var lastCall: Task<Void, Never>?
     private var messageCache: [String: [Message]] = [:]
 
-    /// `storeFactory` nhận c_user và mở `app.db` của tài khoản đó; mặc định `<dataDir>/<c_user>/app.db`.
+    /// `storeFactory` nhận c_user và trả store của tài khoản đó; mặc định là store in-memory (tin nhắn không ghi ra đĩa).
     public init(storeFactory: (@Sendable (String) throws -> LocalStore)? = nil,
                 session: SessionStore = SessionStore(),
                 importer: CookieImporter = CookieImporter(),
                 backend: String = "meta",
+                defaults: UserDefaults = .standard,
                 dataDir: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                    .appendingPathComponent("MacChat"),
+                    .appendingPathComponent("MacMess"),
                 bridgeFactory: @escaping @Sendable (CoreConfig) throws -> any CoreLink = { try CoreBridge(config: $0) }) {
-        self.storeFactory = storeFactory ?? { user in
-            try LocalStore(path: dataDir.appendingPathComponent(user).appendingPathComponent("app.db").path)
-        }
+        self.storeFactory = storeFactory ?? { _ in try LocalStore() }
         self.session = session
         self.importer = importer
         self.backend = backend
+        self.defaults = defaults
         self.dataDir = dataDir
         self.bridgeFactory = bridgeFactory
+        Self.cleanUpLegacyFiles(dataDir: dataDir)
+    }
+
+    /// Thư mục tạm cho bản xem trước (Quick Look). Dọn mỗi lần khởi động.
+    public nonisolated static var previewDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("MacMess-preview", isDirectory: true)
+    }
+
+    /// Xóa `app.db*` của bản trước (tin nhắn không còn lưu ra đĩa) và thư mục xem trước cũ.
+    private static func cleanUpLegacyFiles(dataDir: URL) {
+        Task.detached(priority: .utility) {
+            let fm = FileManager.default
+            try? fm.removeItem(at: previewDirectory)
+            guard let accounts = try? fm.contentsOfDirectory(at: dataDir, includingPropertiesForKeys: nil) else { return }
+            for account in accounts {
+                guard let files = try? fm.contentsOfDirectory(atPath: account.path) else { continue }
+                for f in files where f == "app.db" || f.hasPrefix("app.db-") {
+                    try? fm.removeItem(at: account.appendingPathComponent(f))
+                }
+            }
+        }
     }
 
     /// Tin trong cache của hội thoại (cửa sổ cuối đã nạp bằng `open`, cộng tin mới đến sau đó).
@@ -104,9 +132,9 @@ public final class AppState {
 
     /// Import cookie từ trình duyệt (ngoài main actor vì Keychain có thể mở hộp thoại) rồi đăng nhập.
     public func importLogin(profile: BrowserProfile) async {
-        guard !loggingIn else { loginError = AppError.loginInProgress; return }
-        loggingIn = true
-        defer { loggingIn = false }
+        guard !isLoggingIn else { loginError = AppError.loginInProgress; return }
+        isLoggingIn = true
+        defer { isLoggingIn = false }
         loginError = nil
         let importer = importer
         do {
@@ -120,19 +148,28 @@ public final class AppState {
     /// Lưu cookie vào Keychain, mở store của tài khoản, khởi tạo lõi và gửi `login`.
     /// Gọi khi đang login dở thì đặt `loginError = .loginInProgress` và không làm gì.
     public func login(cookies: [Cookie]) async {
-        guard !loggingIn else { loginError = AppError.loginInProgress; return }
-        loggingIn = true
-        defer { loggingIn = false }
+        guard !isLoggingIn else { loginError = AppError.loginInProgress; return }
+        isLoggingIn = true
+        defer { isLoggingIn = false }
         loginError = nil
         await performLogin(cookies)
     }
 
-    private func performLogin(_ cookies: [Cookie]) async {
+    private enum LoginOutcome { case ok, offline, failed }
+
+    /// `keepOnOffline`: lõi báo lỗi mạng (network/rate_limited) khi login thì giữ phiên ở trạng thái disconnected
+    /// thay vì tearDown, để UI vào màn chính và lõi tự reconnect (dùng cho resume lúc khởi động).
+    @discardableResult
+    private func performLogin(_ cookies: [Cookie], keepOnOffline: Bool = false) async -> LoginOutcome {
         guard let user = cookies.first(where: { $0.name == "c_user" })?.value else {
             loginError = CookieImportError.notLoggedIn
-            return
+            return .failed
         }
+        // Đang ở auth_required thì giữ trạng thái này (AuthBanner) cho tới khi login mới thành công.
+        let previousAuth: ConnectionState? = connection.isAuthRequired ? connection : nil
+        func restoreAuth() { if let previousAuth { connection = previousAuth } }
         await tearDown()
+        restoreAuth()
         cUser = user
         let params = cookies.map {
             CookieParam(name: $0.name, value: $0.value, domain: $0.domain, expires: $0.expires.map { Int64($0.timeIntervalSince1970) })
@@ -152,14 +189,54 @@ public final class AppState {
                 for await event in link.events { await self?.apply(event) }
             }
             let resp = try await link.call(.login(cookies: params, platform: platform))
-            if !resp.ok {
-                loginError = AppError.core(resp.error ?? CoreError(code: "login_failed", message: "login failed"))
-                await tearDown()
+            if resp.ok {
+                isLoggedIn = true
+                defaults.set(user, forKey: Self.lastUserKey)
+                return .ok
             }
+            let err = resp.error ?? CoreError(code: "login_failed", message: "login failed")
+            if keepOnOffline, ["network", "rate_limited"].contains(err.code) {
+                isLoggedIn = true
+                connection = ConnectionState(state: "disconnected", reason: err.code)
+                defaults.set(user, forKey: Self.lastUserKey)
+                return .offline
+            }
+            loginError = AppError.core(err)
+            await tearDown()
+            restoreAuth()
+            return .failed
         } catch {
             loginError = error
             await tearDown()
+            restoreAuth()
+            return .failed
         }
+    }
+
+    static let lastUserKey = "lastUserID"
+
+    public enum ResumeOutcome: Sendable, Equatable {
+        /// Phiên đã khởi động (kể cả khi đang offline: lõi sẽ reconnect, trạng thái hiện ở `connection`).
+        case resumed
+        /// Không có phiên đã lưu, thiếu cookie hoặc lõi từ chối: người dùng phải chọn trình duyệt.
+        case needsLogin
+    }
+
+    /// Đăng nhập lại bằng cookie đã lưu của tài khoản đăng nhập gần nhất.
+    /// Lỗi mạng thì vẫn `.resumed` (offline); chỉ lỗi auth/thiếu cookie/không khởi tạo được lõi mới `.needsLogin`.
+    /// Lỗi auth xảy ra sau khi login (Meta từ chối token) đến qua `connection` = `auth_required` → AuthBanner.
+    public func resumeSavedSession() async -> ResumeOutcome {
+        guard !isLoggingIn, let user = defaults.string(forKey: Self.lastUserKey) else { return .needsLogin }
+        let session = session
+        guard let saved = try? await Task.detached(operation: { try session.loadCookies(cUser: user) }).value,
+              !saved.isEmpty else { return .needsLogin }
+        let cookies = saved.map {
+            Cookie(name: $0.name, value: $0.value, domain: $0.domain, expires: $0.expires.map { Date(timeIntervalSince1970: TimeInterval($0)) })
+        }
+        isLoggingIn = true
+        defer { isLoggingIn = false }
+        loginError = nil
+        return await performLogin(cookies, keepOnOffline: true) == .failed ? .needsLogin : .resumed
     }
 
     public func logout() async {
@@ -170,11 +247,18 @@ public final class AppState {
             try? await Task.detached { try session.deleteCookies(cUser: user) }.value
         }
         cUser = nil
+        defaults.removeObject(forKey: Self.lastUserKey)
     }
 
     public func submitPIN(_ pin: String) {
         guard let link else { return }
         lastCall = Task { _ = try? await link.call(.restoreHistory(pin: pin)) }
+    }
+
+    /// Bỏ qua khôi phục lịch sử E2EE (nhập PIN sau ở Settings).
+    public func skipHistoryRestore() {
+        guard let link else { return }
+        lastCall = Task { _ = try? await link.call(.skipHistoryRestore) }
     }
 
     // MARK: Gửi / đọc
@@ -237,7 +321,7 @@ public final class AppState {
 
     /// Mỗi hội thoại chỉ một batch tại một thời điểm, cách nhau ≥ 1 giây.
     public func loadOlder(conversationID: String) {
-        guard let link, let store, !loadingOlder.contains(conversationID) else { return }
+        guard let link, let store, !loadingOlder.contains(conversationID), !exhausted.contains(conversationID) else { return }
         loadingOlder.insert(conversationID)
         lastCall = Task {
             if let last = lastOlderAt[conversationID] {
@@ -245,9 +329,39 @@ public final class AppState {
                 if wait > .zero { try? await Task.sleep(for: wait) }
             }
             let before = try? await store.oldestTS(conversationID: conversationID)
-            _ = try? await link.call(.fetchMessages(conversationID: conversationID, beforeTS: before, limit: 30))
+            let resp = try? await link.call(.fetchMessages(conversationID: conversationID, beforeTS: before, limit: 30))
+            // Lõi báo hết lịch sử thì không gọi nữa.
+            if case .object(let o)? = resp?.data, case .bool(false)? = o["has_more"] { exhausted.insert(conversationID) }
             lastOlderAt[conversationID] = .now
             loadingOlder.remove(conversationID)
+        }
+    }
+
+    public enum DownloadError: Error, Equatable, Sendable { case failed, inProgress }
+
+    /// Tải media vào thư mục tạm riêng (0700) rồi chuyển vào `directory` với tên an toàn (không đè file có sẵn),
+    /// đặt quarantine sau khi chuyển. Đã tải trong phiên và file còn thì trả lại file cũ. Đang tải cùng attachment thì `.inProgress`.
+    public func downloadMedia(_ attachment: Attachment, into directory: URL) async -> Result<URL, DownloadError> {
+        let key = attachment.ref
+        if let old = downloaded[key], FileManager.default.fileExists(atPath: old.path) { return .success(old) }
+        guard let link else { return .failure(.failed) }
+        guard downloading.insert(key).inserted else { return .failure(.inProgress) }
+        defer { downloading.remove(key) }
+        let fm = FileManager.default
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: tmp) }
+        do {
+            try fm.createDirectory(at: tmp, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            let payload = tmp.appendingPathComponent("payload")
+            let resp = try await link.call(.downloadMedia(attachmentRef: attachment.ref, destPath: payload.path))
+            guard resp.ok, fm.fileExists(atPath: payload.path) else { return .failure(.failed) }
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            let dest = try moveWithUniqueName(from: payload, toDirectory: directory, filename: attachment.filename)
+            markQuarantined(dest)
+            downloaded[key] = dest
+            return .success(dest)
+        } catch {
+            return .failure(.failed)
         }
     }
 
@@ -293,7 +407,7 @@ public final class AppState {
 
     // MARK: Nội bộ
 
-    static func fileProblem(_ url: URL) -> CoreError? {
+    public static func fileProblem(_ url: URL) -> CoreError? {
         guard FileManager.default.isReadableFile(atPath: url.path),
               let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) else {
             return CoreError(code: "file_unreadable", message: "cannot read file")
@@ -378,6 +492,10 @@ public final class AppState {
         conversations = []
         messageCache = [:]
         historyRestore = HistoryRestoreState(state: "none")
+        isLoggedIn = false
+        exhausted = []
+        downloading = []
+        downloaded = [:]
         connection = .disconnected
         loadingOlder = []
         lastOlderAt = [:]

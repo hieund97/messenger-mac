@@ -1,4 +1,4 @@
-# MacChat Phase 1 Implementation Plan
+# MacMess Phase 1 Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -15,10 +15,10 @@
 - Không dùng WebView (`WKWebView`, `WebView`, `SFSafariViewController`) ở bất kỳ đâu.
 - macOS 14+, universal binary arm64 + x86_64. Không sandbox.
 - Giấy phép AGPL-3.0 cho toàn repo.
-- Tên app tạm là `MacChat`, bundle id `dev.hieund.macchat`. Không dùng tên hay logo Messenger/Meta.
+- Tên app tạm là `MacMess`, bundle id `dev.hieund.macmess`. Không dùng tên hay logo Messenger/Meta.
 - Cookie bắt buộc: `c_user`, `xs`, `datr`. Thứ tự ưu tiên domain: `.messenger.com` rồi đến `.facebook.com`.
-- Dữ liệu đặt trong `~/Library/Application Support/MacChat/<c_user>/`, gồm `e2ee.db` (whatsmeow sqlstore) và `app.db` (GRDB).
-- Không lưu mật khẩu Facebook và PIN dạng thô. Bí mật chỉ nằm trong Keychain của app, service `dev.hieund.macchat`.
+- Dữ liệu đặt trong `~/Library/Application Support/MacMess/<c_user>/`, gồm `e2ee.db` (whatsmeow sqlstore) và `core.log`. Tin nhắn/hội thoại KHÔNG ghi ra đĩa: LocalStore là GRDB in-memory, mỗi lần mở app tải lại từ server (người dùng chốt 2026-11-09).
+- Không lưu mật khẩu Facebook và PIN dạng thô. Bí mật chỉ nằm trong Keychain của app, service `dev.hieund.macmess`.
 - `client_id` do Swift tạo, giữ nguyên khi retry. Lõi dùng nó làm OTID/message ID. Không tự gửi lại khi trạng thái là `unknown`.
 - Backfill chỉ chạy khi người dùng cuộn lên. Mỗi batch cách nhau ≥ 1 giây.
 - Commit message không có dòng Co-Authored-By Claude.
@@ -73,12 +73,12 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 
 **Files:**
 - Create: `LICENSE` (AGPL-3.0), `.gitignore`, `README.md` (1 đoạn), `Makefile`
-- Create: `core/go.mod` (module `macchat/core`), `core/capi/capi.go`, `core/capi/core.h`
+- Create: `core/go.mod` (module `macmess/core`), `core/capi/capi.go`, `core/capi/core.h`
 - Create: `MessengerKit/Package.swift`, `MessengerKit/Sources/CoreBridge/CoreBridge.swift`, `MessengerKit/Tests/CoreBridgeTests/SmokeTests.swift`
-- Create: `App/Package.swift`, `App/Sources/MacChat/MacChatApp.swift`, `App/Resources/Info.plist`, `scripts/make-app.sh`
+- Create: `App/Package.swift`, `App/Sources/MacMess/MacMessApp.swift`, `App/Resources/Info.plist`, `scripts/make-app.sh`
 
 **Interfaces:**
-- Produces: target `make core` → `core/build/MessengerCore.xcframework` (lipo arm64 + amd64, header `core.h`). SwiftPM `binaryTarget(name: "MessengerCore", path: "../core/build/MessengerCore.xcframework")`. Target `make app` → `build/MacChat.app`.
+- Produces: target `make core` → `core/build/MessengerCore.xcframework` (lipo arm64 + amd64, header `core.h`). SwiftPM `binaryTarget(name: "MessengerCore", path: "../core/build/MessengerCore.xcframework")`. Target `make app` → `build/MacMess.app`.
 - `core.h` khai báo đúng 4 hàm sau (Task 2 sẽ cài):
   ```c
   typedef void (*core_event_cb)(const char *event_json);
@@ -91,8 +91,8 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 - [ ] **Step 1:** `git init`, tạo các file trên. `capi.go` tạm cài 4 hàm rỗng: `core_init` trả 0, `core_call` trả 1.
 - [ ] **Step 2:** Viết test `SmokeTests.testInitReturnsZero`: `#expect(core_init("{}", nil) == 0)`.
 - [ ] **Step 3:** Chạy `make core kit-test`. Kỳ vọng: PASS.
-- [ ] **Step 4:** `make app`. Kỳ vọng: `build/MacChat.app` mở được, hiện một cửa sổ trống. Kiểm tra bằng `lipo -archs build/MacChat.app/Contents/MacOS/MacChat`, kết quả phải là `x86_64 arm64`.
-- [ ] **Step 5:** Commit `chore: khởi tạo repo MacChat với build lõi Go universal và app SwiftPM`.
+- [ ] **Step 4:** `make app`. Kỳ vọng: `build/MacMess.app` mở được, hiện một cửa sổ trống. Kiểm tra bằng `lipo -archs build/MacMess.app/Contents/MacOS/MacMess`, kết quả phải là `x86_64 arm64`.
+- [ ] **Step 5:** Commit `chore: khởi tạo repo MacMess với build lõi Go universal và app SwiftPM`.
 
 ### Task 2: Giao thức lệnh/sự kiện, C API và backend giả
 
@@ -183,6 +183,7 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 - `fetch_messages` trả về các `message_upsert` theo thứ tự thời gian giảm dần, cuối cùng là `response{ok, data:{has_more:Bool}}`. Lịch sử thường dùng `FetchMessagesTask` (label 228). Lịch sử E2EE đọc từ secure history đã khôi phục.
 - Sau khi đăng nhập: chưa khôi phục thì phát `history_restore_state=needed`. `restore_history{pin}` chuyển sang `in_progress` rồi `done`, hoặc `failed{reason:"wrong_pin"|"no_backup"|"other"}`. Bí mật cần giữ lại phát qua event `secret_store{key, value}` để Swift lưu Keychain. Lõi không ghi PIN ra đĩa.
 - Tin E2EE gửi đi được đẩy lên backup theo `history_upload.go`.
+- Vì tin nhắn không lưu ra đĩa: mỗi lần login, nếu Swift gửi kèm bí mật secure history đã lưu (lệnh `login` thêm `secrets` tùy chọn) thì lõi tự khôi phục lịch sử E2EE, không hỏi lại PIN. Chỉ phát `history_restore_state=needed` khi chưa có bí mật.
 
 - [ ] **Step 1:** Viết test: `TestFetchPagingStopsWhenNoMore`, `TestFetchBatchesSpacedAtLeast1s`, `TestWrongPinEmitsFailedWrongPin`, `TestPinNeverWrittenToDisk` (quét data dir sau `restore_history` thì không thấy chuỗi PIN), `TestSentE2EEMessageQueuedForUpload`.
 - [ ] **Step 2:** Chạy test. Kỳ vọng: FAIL.
@@ -217,7 +218,7 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 **Interfaces:**
 - Consumes: `CoreBridge`, `CoreEvent` (Task 2). `CookieImporter` (Task 7).
 - `LocalStore(path:)`: bảng `conversation(id PK)`, `message(id PK, conversation_id, client_id UNIQUE NULL, ts, status, ...)`, `attachment(message_id, ref, ...)`. `upsert(_ Message)`: nếu có `client_id` trùng với tin optimistic thì thay tin đó bằng `id` thật.
-- `SessionStore`: lưu cookie và các `secret_store` trong Keychain service `dev.hieund.macchat`, account `<c_user>/<key>`.
+- `SessionStore`: lưu cookie và các `secret_store` trong Keychain service `dev.hieund.macmess`, account `<c_user>/<key>`.
 - `@MainActor @Observable final class AppState`: `conversations: [Conversation]`, `messages(for:) -> [Message]`, `connection: ConnectionState`, `historyRestore: HistoryRestoreState`, `func send(text:to:)`, `func send(file:to:)`, `func retry(clientID:)`, `func loadOlder(conversationID:)`, `func markRead(conversationID:)`, `func importLogin(profile:)`, `func submitPIN(_:)`.
 - `send` thêm tin optimistic `status=.sending` với `client_id = UUID()`. `retry` dùng lại `client_id` cũ.
 
@@ -230,7 +231,7 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 ### Task 9: UI SwiftUI
 
 **Files:**
-- Create trong `App/Sources/MacChat/`: `Onboarding/{RiskWarningView, BrowserPickerView, PINEntryView}.swift`, `Main/{SidebarView, ConversationRow, ChatView, MessageBubble, ComposerView, AuthBanner}.swift`, `Settings/SettingsView.swift`
+- Create trong `App/Sources/MacMess/`: `Onboarding/{RiskWarningView, BrowserPickerView, PINEntryView}.swift`, `Main/{SidebarView, ConversationRow, ChatView, MessageBubble, ComposerView, AuthBanner}.swift`, `Settings/SettingsView.swift`
 
 **Interfaces:**
 - Consumes: `AppState` (Task 8).
@@ -242,15 +243,15 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 - `AuthBanner` hiện khi `connection == .authRequired`, có nút "Đăng nhập lại" mở lại `BrowserPickerView`.
 - `SettingsView`: nhập PIN, chọn lại trình duyệt, đăng xuất, bật/tắt "Mở khi đăng nhập macOS".
 
-- [ ] **Step 1:** Cài các view, chạy app bằng `{"backend":"fake"}` (biến môi trường `MACCHAT_FAKE=1`).
-- [ ] **Step 2:** `make app && MACCHAT_FAKE=1 open build/MacChat.app`. Kiểm từng mục: luồng onboarding, gửi text, kéo-thả file, xem ảnh, tin `unknown` có nút gửi lại, banner auth. Chụp màn hình lưu vào `docs/screenshots/` (không commit).
+- [ ] **Step 1:** Cài các view, chạy app bằng `{"backend":"fake"}` (biến môi trường `MACMESS_FAKE=1`).
+- [ ] **Step 2:** `make app && MACMESS_FAKE=1 open build/MacMess.app`. Kiểm từng mục: luồng onboarding, gửi text, kéo-thả file, xem ảnh, tin `unknown` có nút gửi lại, banner auth. Chụp màn hình lưu vào `docs/screenshots/` (không commit).
 - [ ] **Step 3:** `grep -rE 'WKWebView|WebKit|SFSafari' App MessengerKit`. Kỳ vọng: không có kết quả.
 - [ ] **Step 4:** Commit `feat(app): giao diện đăng nhập, PIN, danh sách hội thoại và khung chat có gửi file`.
 
 ### Task 10: `Notifier` và `Lifecycle`
 
 **Files:**
-- Create: `MessengerKit/Sources/AppCore/NotificationPolicy.swift` + test, `App/Sources/MacChat/{Notifier.swift, Lifecycle.swift, AppDelegate.swift}`
+- Create: `MessengerKit/Sources/AppCore/NotificationPolicy.swift` + test, `App/Sources/MacMess/{Notifier.swift, Lifecycle.swift, AppDelegate.swift}`
 
 **Interfaces:**
 - `NotificationPolicy.shouldNotify(message:, activeConversationID:, appIsActive:, connectedAt:, lastKnownTs:) -> Bool`: trả false nếu tin do mình gửi, tin thuộc hội thoại đang mở khi app active, tin đến từ backfill, hoặc `ts < connectedAt` và `ts <= lastKnownTs`.
@@ -268,7 +269,7 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 - Create: `scripts/create-signing-cert.md`, `scripts/release.sh`, `appcast.xml` (template), `README.md` (cài đặt, mở lần đầu, cảnh báo rủi ro, giấy phép)
 - Modify: `App/Package.swift` (thêm Sparkle 2), `App/Resources/Info.plist` (`SUFeedURL`, `SUPublicEDKey`, `LSMinimumSystemVersion=14.0`)
 
-- [ ] **Step 1:** Hướng dẫn tạo chứng chỉ tự ký "MacChat Self-Signed" (Keychain Access → Certificate Assistant, loại Code Signing). User tự làm một lần.
-- [ ] **Step 2:** `release.sh <version>` làm các bước: `make core app` → `codesign --deep --force --options runtime -s "MacChat Self-Signed"` → `create-dmg` → `sign_update` (Sparkle EdDSA) → in đoạn XML cho `appcast.xml`. Khóa EdDSA riêng nằm trong Keychain của user, không commit.
-- [ ] **Step 3:** Kiểm: `codesign -dv build/MacChat.app` hiện đúng authority. Cài từ `.dmg` trên một user macOS khác thì mở được qua "Open Anyway". Cập nhật từ 0.1.0 lên 0.1.1 qua Sparkle thì không bị hỏi lại quyền Keychain và quyền thông báo.
+- [ ] **Step 1:** Hướng dẫn tạo chứng chỉ tự ký "MacMess Self-Signed" (Keychain Access → Certificate Assistant, loại Code Signing). User tự làm một lần.
+- [ ] **Step 2:** `release.sh <version>` làm các bước: `make core app` → `codesign --deep --force --options runtime -s "MacMess Self-Signed"` → `create-dmg` → `sign_update` (Sparkle EdDSA) → in đoạn XML cho `appcast.xml`. Khóa EdDSA riêng nằm trong Keychain của user, không commit.
+- [ ] **Step 3:** Kiểm: `codesign -dv build/MacMess.app` hiện đúng authority. Cài từ `.dmg` trên một user macOS khác thì mở được qua "Open Anyway". Cập nhật từ 0.1.0 lên 0.1.1 qua Sparkle thì không bị hỏi lại quyền Keychain và quyền thông báo.
 - [ ] **Step 4:** Commit `build: đóng gói dmg ký bằng chứng chỉ tự ký và tự cập nhật qua Sparkle`.
