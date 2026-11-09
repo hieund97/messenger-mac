@@ -211,6 +211,16 @@ func (e *e2eeConn) connect() error {
 	return nil
 }
 
+// client returns the connected whatsmeow client of this session, or nil while E2EE is down.
+func (e *e2eeConn) client() *whatsmeow.Client {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return nil
+	}
+	return e.cli
+}
+
 func (e *e2eeConn) current(cli *whatsmeow.Client) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()

@@ -11,6 +11,10 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/loginerrors"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	waEvents "go.mau.fi/whatsmeow/types/events"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -247,5 +251,34 @@ func TestE2EEFailuresNeverRequireAuth(t *testing.T) {
 	b.mu.Unlock()
 	if e.handle(nil, &waEvents.FBMessage{}) {
 		t.Fatal("message acked without a session")
+	}
+}
+
+func TestCoreLogRedactsTokens(t *testing.T) {
+	dir := t.TempDir()
+	b := NewMetaBackend(Config{DataDir: dir})
+	b.newClient = func(_ *cookies.Cookies, log zerolog.Logger) metaClient {
+		// What messagix logs on a failed Mercury request (httpclient/http.go, mercury.go).
+		urlErr := &url.Error{Op: "Post", URL: "https://www.facebook.com/ajax/mercury/upload.php?__a=1&fb_dtsg=SECRET1&jazoest=SECRET2", Err: errors.New("EOF")}
+		log.Error().Err(urlErr).
+			Str("url", "https://upload.messenger.com/ajax/mercury/upload.php?fb_dtsg=SECRET3&lsd=SECRET4").
+			Str("body", "av=1&fb_dtsg=SECRET5&lsd=SECRET6&jazoest=SECRET7").
+			Str("json", `{"access_token":"SECRET8","fb_dtsg": "SECRET9"}`).
+			Msg("Failed to send Mercury request")
+		return &testMetaClient{}
+	}
+	if err := b.Login(context.Background(), validArgs("messenger"), nil); err != nil {
+		t.Fatal(err)
+	}
+	b.stop()
+	data, err := os.ReadFile(filepath.Join(dir, "1", "core.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "SECRET") {
+		t.Fatalf("token in log: %s", data)
+	}
+	if !strings.Contains(string(data), "upload.php?REDACTED") || !strings.Contains(string(data), "Failed to send Mercury request") {
+		t.Fatalf("log = %s", data)
 	}
 }

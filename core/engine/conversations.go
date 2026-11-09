@@ -39,6 +39,7 @@ type convEntry struct {
 	peer          int64
 	normalThread  int64  // Lightspeed thread key, 0 if unknown
 	e2eeThread    string // "<peer>@msgr", empty if unknown
+	lsE2EEKey     int64  // Lightspeed key of the E2EE thread (hybrid mapping), 0 if unknown
 	linked        bool   // seen in LSCreateOpenToE2EEThreadLink
 	threadName    string
 	threadPicture string
@@ -68,25 +69,61 @@ type ThreadIndex struct {
 	// sent from this app carry the client_id that Swift generated.
 	otidClient map[string]string
 	waClient   map[string]string
+	// waUnread holds recent incoming E2EE message IDs per conversation for mark_read.
+	waUnread map[string][]waIncoming
+	// historyMuted holds Lightspeed thread keys whose upserted (history) messages are not emitted until
+	// the given time: a media URL refresh re-fetches a page of old messages that Swift did not ask for.
+	historyMuted map[int64]time.Time
 }
+
+type waIncoming struct {
+	id string
+	ts int64
+}
+
+// waUnreadCapacity bounds waUnread per conversation; older IDs are dropped first.
+const waUnreadCapacity = 200
 
 func NewThreadIndex(selfID int64) *ThreadIndex {
 	return &ThreadIndex{
-		self:        selfID,
-		log:         zerolog.Nop(),
-		convs:       map[string]*convEntry{},
-		threads:     map[string]string{},
-		hybrid:      map[int64]int64{},
-		ignored:     map[int64]bool{},
-		pending:     map[int64]int64{},
-		confirmed:   map[int64]bool{},
-		pendingE2EE: map[int64]lsThread{},
-		contacts:    map[int64]contactInfo{},
-		seen:        map[string]*list.Element{},
-		seenList:    list.New(),
-		otidClient:  map[string]string{},
-		waClient:    map[string]string{},
+		self:         selfID,
+		log:          zerolog.Nop(),
+		convs:        map[string]*convEntry{},
+		threads:      map[string]string{},
+		hybrid:       map[int64]int64{},
+		ignored:      map[int64]bool{},
+		pending:      map[int64]int64{},
+		confirmed:    map[int64]bool{},
+		pendingE2EE:  map[int64]lsThread{},
+		contacts:     map[int64]contactInfo{},
+		seen:         map[string]*list.Element{},
+		seenList:     list.New(),
+		otidClient:   map[string]string{},
+		waClient:     map[string]string{},
+		waUnread:     map[string][]waIncoming{},
+		historyMuted: map[int64]time.Time{},
 	}
+}
+
+// muteHistory stops upserted messages of thread key from being emitted until the given time. Messages
+// already emitted are deduplicated anyway, so only the media URLs of the re-fetched page are used.
+func (x *ThreadIndex) muteHistory(key int64, until time.Time) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	now := time.Now()
+	for k, t := range x.historyMuted {
+		if now.After(t) {
+			delete(x.historyMuted, k)
+		}
+	}
+	if until.After(x.historyMuted[key]) {
+		x.historyMuted[key] = until
+	}
+}
+
+func (x *ThreadIndex) historyIsMuted(key int64) bool {
+	t, ok := x.historyMuted[key]
+	return ok && time.Now().Before(t)
 }
 
 // RememberClientID records the identifiers a send used, so the echo can be matched back.
@@ -385,6 +422,7 @@ func (x *ThreadIndex) ApplyTable(tbl *table.LSTable, emit func(Event)) {
 		x.update(peer, emit, func(e *convEntry) {
 			if e2ee {
 				e.e2eeThread = e2eeThreadID(peer)
+				e.lsE2EEKey = t.key
 				x.threads[strconv.FormatInt(t.key, 10)] = e.conv.ID
 			} else if mode == resolveOK {
 				e.normalThread = t.key
@@ -415,6 +453,7 @@ func (x *ThreadIndex) ApplyTable(tbl *table.LSTable, emit func(Event)) {
 		jid, key, ts := m.ThreadJID, m.ThreadKey, m.LastActivityTimestampMS
 		x.update(jid, emit, func(e *convEntry) {
 			e.e2eeThread = e2eeThreadID(jid)
+			e.lsE2EEKey = key
 			x.threads[strconv.FormatInt(key, 10)] = e.conv.ID
 			x.touch(e, ts, nil)
 		})
@@ -451,6 +490,9 @@ func (x *ThreadIndex) ApplyTable(tbl *table.LSTable, emit func(Event)) {
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 	for _, k := range keys {
+		if x.historyIsMuted(k) {
+			continue
+		}
 		msgs = append(msgs, upsert[k].Messages...)
 	}
 	msgs = append(msgs, insert...)
@@ -545,7 +587,73 @@ func (x *ThreadIndex) ApplyWAMessage(evt *events.FBMessage, emit func(Event)) {
 		e.e2eeThread = chat.ToNonAD().String()
 		x.touch(e, m.TS, messagePreview(m))
 	})
+	if !m.IsOutgoing {
+		list := append(x.waUnread[id], waIncoming{id: m.ID, ts: m.TS})
+		if len(list) > waUnreadCapacity {
+			list = list[len(list)-waUnreadCapacity:]
+		}
+		x.waUnread[id] = list
+	}
 	emit(Event{Type: EventMessageUpsert, Data: m})
+}
+
+// readTargets are the threads mark_read writes to for one conversation.
+type readTargets struct {
+	normalThread int64       // Lightspeed thread, sync group 1
+	e2eeLSKey    int64       // Lightspeed key of the E2EE thread, sync group 95
+	e2eeChat     waTypes.JID // E2EE chat to send read receipts in
+	waIDs        []string    // incoming E2EE messages at or before until_ts
+	waTaken      []waIncoming
+}
+
+// takeReadTargets returns where to mark convID read up to untilTS. The returned E2EE message IDs are
+// removed from the index, so each receipt is sent once.
+func (x *ThreadIndex) takeReadTargets(convID string, untilTS int64) (readTargets, bool) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	e := x.convs[convID]
+	if e == nil {
+		return readTargets{}, false
+	}
+	t := readTargets{normalThread: e.normalThread, e2eeLSKey: e.lsE2EEKey}
+	if e.e2eeThread != "" {
+		if jid, err := waTypes.ParseJID(e.e2eeThread); err == nil {
+			t.e2eeChat = jid
+		}
+	}
+	var keep []waIncoming
+	for _, m := range x.waUnread[convID] {
+		if m.ts <= untilTS {
+			t.waIDs = append(t.waIDs, m.id)
+			t.waTaken = append(t.waTaken, m)
+		} else {
+			keep = append(keep, m)
+		}
+	}
+	if len(keep) == 0 {
+		delete(x.waUnread, convID)
+	} else {
+		x.waUnread[convID] = keep
+	}
+	return t, true
+}
+
+// restoreUnread puts back E2EE message IDs whose read receipt failed, ahead of the newer ones, keeping
+// the newest waUnreadCapacity.
+func (x *ThreadIndex) restoreUnread(convID string, taken []waIncoming) {
+	if len(taken) == 0 {
+		return
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.convs[convID] == nil {
+		return
+	}
+	list := append(append([]waIncoming(nil), taken...), x.waUnread[convID]...)
+	if len(list) > waUnreadCapacity {
+		list = list[len(list)-waUnreadCapacity:]
+	}
+	x.waUnread[convID] = list
 }
 
 func (x *ThreadIndex) setLogger(log zerolog.Logger) {
@@ -583,6 +691,9 @@ func (b *MetaBackend) handleTable(client metaClient, tbl *table.LSTable) {
 		emit, index = b.emit, b.index
 	}
 	b.mu.Unlock()
+	// Send confirmations and refreshed media URLs may arrive over the socket instead of in the response.
+	b.waits.observe(tbl)
+	b.refreshes.observe(tbl)
 	if emit != nil && index != nil {
 		index.ApplyTable(tbl, emit)
 	}

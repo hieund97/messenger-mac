@@ -3,9 +3,12 @@ package engine
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"sync"
@@ -62,6 +65,17 @@ type MetaBackend struct {
 	e2eeFullReconnects int
 	lastE2EEReconnect  time.Time
 	icdcFailures       int
+	// Sending, read receipts and media (send.go, media.go). Tests set the overrides; nil means the
+	// live session's messagix and whatsmeow clients.
+	lsOverride  lsOps
+	waOverride  waOps
+	sendTimeout time.Duration // 0 means sendConfirmTimeout
+	mediaHTTP   *http.Client  // nil means sharedMediaClient
+	waits       confirmWaits
+	sends       sendQueue
+	refreshes   mediaRefreshes
+	// onE2EESent, when set, is called after each successful E2EE send (see E2EESentHook).
+	onE2EESent E2EESentHook
 }
 
 var e2eeFullReconnectBackoff = []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute}
@@ -138,7 +152,8 @@ func (b *MetaBackend) startSession(ctx context.Context, c *cookies.Cookies, plat
 		if err != nil {
 			return err
 		}
-		log = zerolog.New(file).Level(zerolog.ErrorLevel)
+		// messagix logs request URLs (with fb_dtsg in the query) on errors; never let them reach the file.
+		log = zerolog.New(redactingWriter{file}).Level(zerolog.ErrorLevel)
 	}
 	_ = platform // The platform is already retained in c.
 	var client metaClient
@@ -437,15 +452,28 @@ func (*MetaBackend) SkipHistoryRestore(context.Context, SkipHistoryRestoreArgs, 
 func (*MetaBackend) FetchMessages(context.Context, FetchMessagesArgs, func(Event)) error {
 	return notImplemented()
 }
-func (*MetaBackend) SendText(context.Context, SendTextArgs, func(Event)) error {
-	return notImplemented()
+
+var (
+	// logURLQuery matches the query of an http(s) URL inside a log line. It stops at whitespace, a
+	// quote or a backslash (a JSON-escaped quote in an error string).
+	logURLQuery = regexp.MustCompile(`(https?://[^\s"'\\?#]+)\?[^\s"'\\#]*`)
+	// logSecretParam matches token parameters outside URLs: form bodies (fb_dtsg=...) and JSON fields
+	// ("fb_dtsg":"..." or the escaped form inside an error string).
+	logSecretParam = regexp.MustCompile(`(?i)\b((?:fb_dtsg|lsd|jazoest|access_token)(?:=|\\?"\s*:\s*\\?"))[^&\s"\\,}]*`)
+)
+
+// redactLogLine removes tokens and URL queries from one log line.
+func redactLogLine(p []byte) []byte {
+	p = logURLQuery.ReplaceAll(p, []byte("$1?REDACTED"))
+	return logSecretParam.ReplaceAll(p, []byte("${1}REDACTED"))
 }
-func (*MetaBackend) SendMedia(context.Context, SendMediaArgs, func(Event)) error {
-	return notImplemented()
-}
-func (*MetaBackend) MarkRead(context.Context, MarkReadArgs, func(Event)) error {
-	return notImplemented()
-}
-func (*MetaBackend) DownloadMedia(context.Context, DownloadMediaArgs, func(Event)) error {
-	return notImplemented()
+
+// redactingWriter redacts every log line before writing it. zerolog writes one line per Write call.
+type redactingWriter struct{ w io.Writer }
+
+func (r redactingWriter) Write(p []byte) (int, error) {
+	if _, err := r.w.Write(redactLogLine(p)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }

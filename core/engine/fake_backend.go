@@ -24,17 +24,27 @@ func (FakeBackend) ListConversations(context.Context, ListConversationsArgs, fun
 	return nil
 }
 func (FakeBackend) FetchMessages(context.Context, FetchMessagesArgs, func(Event)) error { return nil }
-func (FakeBackend) SendText(_ context.Context, a SendTextArgs, emit func(Event)) error {
-	fakeSend(a.ClientID, emit)
+func (FakeBackend) SendText(ctx context.Context, a SendTextArgs, emit func(Event)) error {
+	fakeSend(ctx, a.ClientID, emit)
 	return nil
 }
-func (FakeBackend) SendMedia(_ context.Context, a SendMediaArgs, emit func(Event)) error {
-	fakeSend(a.ClientID, emit)
+func (FakeBackend) SendMedia(ctx context.Context, a SendMediaArgs, emit func(Event)) error {
+	fakeSend(ctx, a.ClientID, emit)
 	return nil
 }
-func fakeSend(id string, emit func(Event)) {
+
+// fakeSend reports after the response, like MetaBackend.
+func fakeSend(ctx context.Context, id string, emit func(Event)) {
 	messageID := "fake-" + id
-	emit(Event{Type: EventMessageSendResult, Data: MessageSendResult{ClientID: id, Status: "sent", MessageID: &messageID}})
+	result := func() {
+		emit(Event{Type: EventMessageSendResult, Data: MessageSendResult{ClientID: id, Status: "sent", MessageID: &messageID}})
+	}
+	responded := responseSent(ctx)
+	if responded == nil {
+		result()
+		return
+	}
+	go func() { <-responded; result() }()
 }
 func (FakeBackend) MarkRead(context.Context, MarkReadArgs, func(Event)) error           { return nil }
 func (FakeBackend) DownloadMedia(context.Context, DownloadMediaArgs, func(Event)) error { return nil }

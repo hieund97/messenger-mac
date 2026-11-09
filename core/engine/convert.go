@@ -28,6 +28,8 @@ type mediaRef struct {
 	FBID      string `json:"f,omitempty"`
 	MessageID string `json:"m,omitempty"`
 	ThreadKey int64  `json:"t,omitempty"`
+	// TimestampMS is the message timestamp; a refresh re-fetches the thread around it.
+	TimestampMS int64 `json:"ts,omitempty"`
 	// E2EE attachments, mirroring msgconv.DirectMediaWhatsApp.
 	DirectPath string `json:"dp,omitempty"`
 	MediaType  string `json:"mt,omitempty"` // image | video | audio | document | sticker
@@ -42,12 +44,8 @@ func encodeMediaRef(ref mediaRef) string {
 	return ref.Kind + ":" + base64.RawURLEncoding.EncodeToString(raw)
 }
 
-// decodeMediaRef parses Attachment.Ref. The ref comes back from Swift, so for download_media (Task 5)
-// treat it as untrusted input:
-//   - fb refs: fetch URL only over https from an allowlist of Meta CDN hosts (*.fbcdn.net, ...), and
-//     never attach the session cookies to CDN requests;
-//   - wa refs: DirectPath must start with "/" (whatsmeow joins it onto its own media host), and the
-//     media type must be one of the known values.
+// decodeMediaRef parses Attachment.Ref. The ref comes back from Swift and is untrusted:
+// download_media checks it with validateMediaRef (media.go) before fetching anything.
 func decodeMediaRef(s string) (mediaRef, error) {
 	kind, payload, ok := strings.Cut(s, ":")
 	if !ok || (kind != mediaRefFB && kind != mediaRefWA) {
@@ -119,7 +117,7 @@ func lsKind(t table.AttachmentType, mime string) string {
 
 // lsAttachment follows msgconv.blobAttachmentToMatrix (pkg/msgconv/from-meta.go:327): the playable URL
 // is the full file, the preview URL is used when there is no playable URL.
-func lsAttachment(fbid, messageID string, threadKey int64, attType table.AttachmentType, filename string, size int64,
+func lsAttachment(fbid, messageID string, threadKey, ts int64, attType table.AttachmentType, filename string, size int64,
 	playable, playableMIME string, playableExp int64, preview, previewMIME string, previewExp int64, mime string, w, h int64) Attachment {
 	url, urlMIME, exp := playable, playableMIME, playableExp
 	if url == "" {
@@ -136,7 +134,7 @@ func lsAttachment(fbid, messageID string, threadKey int64, attType table.Attachm
 	}
 	return Attachment{
 		Ref: encodeMediaRef(mediaRef{Kind: mediaRefFB, URL: url, ExpiresMS: exp, FBID: fbid, MessageID: messageID,
-			ThreadKey: threadKey, MIME: urlMIME}),
+			ThreadKey: threadKey, TimestampMS: ts, MIME: urlMIME}),
 		Kind:       lsKind(attType, mime),
 		MIME:       mime,
 		Filename:   optString(filename),
@@ -171,17 +169,17 @@ func fromLS(msg *table.WrappedMessage, convID string, selfID int64, clientID *st
 		m.ReplyToID = &msg.ReplySourceId
 	}
 	for _, a := range msg.BlobAttachments {
-		m.Attachments = append(m.Attachments, lsAttachment(a.AttachmentFbid, msg.MessageId, msg.ThreadKey, a.AttachmentType,
+		m.Attachments = append(m.Attachments, lsAttachment(a.AttachmentFbid, msg.MessageId, msg.ThreadKey, msg.TimestampMs, a.AttachmentType,
 			a.Filename, a.Filesize, a.PlayableUrl, a.PlayableUrlMimeType, a.PlayableUrlExpirationTimestampMs,
 			a.PreviewUrl, a.PreviewUrlMimeType, a.PreviewUrlExpirationTimestampMs, a.AttachmentMimeType, a.PreviewWidth, a.PreviewHeight))
 	}
 	for _, a := range msg.Attachments {
-		m.Attachments = append(m.Attachments, lsAttachment(a.AttachmentFbid, msg.MessageId, msg.ThreadKey, a.AttachmentType,
+		m.Attachments = append(m.Attachments, lsAttachment(a.AttachmentFbid, msg.MessageId, msg.ThreadKey, msg.TimestampMs, a.AttachmentType,
 			a.Filename, a.Filesize, a.PlayableUrl, a.PlayableUrlMimeType, a.PlayableUrlExpirationTimestampMs,
 			a.PreviewUrl, a.PreviewUrlMimeType, a.PreviewUrlExpirationTimestampMs, a.AttachmentMimeType, a.PreviewWidth, a.PreviewHeight))
 	}
 	for _, a := range msg.Stickers {
-		m.Attachments = append(m.Attachments, lsAttachment(a.AttachmentFbid, msg.MessageId, msg.ThreadKey, table.AttachmentTypeSticker,
+		m.Attachments = append(m.Attachments, lsAttachment(a.AttachmentFbid, msg.MessageId, msg.ThreadKey, msg.TimestampMs, table.AttachmentTypeSticker,
 			"", 0, a.PlayableUrl, a.PlayableUrlMimeType, a.PlayableUrlExpirationTimestampMs,
 			a.PreviewUrl, a.PreviewUrlMimeType, a.PreviewUrlExpirationTimestampMs, "", a.PreviewWidth, a.PreviewHeight))
 	}

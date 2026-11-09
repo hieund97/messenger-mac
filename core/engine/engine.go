@@ -95,13 +95,34 @@ func (e *Engine) Shutdown() {
 	e.stopped = true
 	e.emitMu.Unlock()
 }
+
+// responseSentKey carries a channel that is closed once the command's response was emitted.
+type responseSentKey struct{}
+
+// responseSent returns the channel closed after the response of the command whose context is ctx was
+// emitted, or nil outside a command. Events that must follow the response (message_send_result) wait
+// on it.
+func responseSent(ctx context.Context) <-chan struct{} {
+	if ctx == nil {
+		return nil
+	}
+	ch, _ := ctx.Value(responseSentKey{}).(chan struct{})
+	if ch == nil {
+		return nil
+	}
+	return ch
+}
+
 func (e *Engine) run(id int64, raw []byte) {
 	response := Response{OK: true}
+	responded := make(chan struct{})
+	ctx := context.WithValue(e.ctx, responseSentKey{}, responded)
 	defer func() {
 		if recover() != nil {
 			response = Response{Error: &Error{Code: "internal", Message: "backend panic"}}
 		}
 		e.send(Event{Type: EventResponse, RequestID: &id, Data: response})
+		close(responded)
 	}()
 	fail := func(code, message string) { response = Response{Error: &Error{Code: code, Message: message}} }
 	var req Request
@@ -120,27 +141,27 @@ func (e *Engine) run(id int64, raw []byte) {
 	)
 	switch req.Cmd {
 	case CmdLogin:
-		call, err = decodeArgs(req.Args, e.ctx, emit, e.backend.Login)
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.Login)
 	case CmdRestoreHistory:
-		call, err = decodeArgs(req.Args, e.ctx, emit, e.backend.RestoreHistory)
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.RestoreHistory)
 	case CmdSkipHistoryRestore:
-		call, err = decodeArgs(req.Args, e.ctx, emit, e.backend.SkipHistoryRestore)
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.SkipHistoryRestore)
 	case CmdLogout:
-		call, err = decodeArgs(req.Args, e.ctx, emit, e.backend.Logout)
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.Logout)
 	case CmdReconnect:
-		call, err = decodeArgs(req.Args, e.ctx, emit, e.backend.Reconnect)
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.Reconnect)
 	case CmdListConversations:
-		call, err = decodeArgs(req.Args, e.ctx, emit, e.backend.ListConversations)
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.ListConversations)
 	case CmdFetchMessages:
-		call, err = decodeArgs(req.Args, e.ctx, emit, e.backend.FetchMessages)
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.FetchMessages)
 	case CmdSendText:
-		call, err = decodeArgs(req.Args, e.ctx, emit, e.backend.SendText)
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.SendText)
 	case CmdSendMedia:
-		call, err = decodeArgs(req.Args, e.ctx, emit, e.backend.SendMedia)
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.SendMedia)
 	case CmdMarkRead:
-		call, err = decodeArgs(req.Args, e.ctx, emit, e.backend.MarkRead)
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.MarkRead)
 	case CmdDownloadMedia:
-		call, err = decodeArgs(req.Args, e.ctx, emit, e.backend.DownloadMedia)
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.DownloadMedia)
 	default:
 		fail("unknown_cmd", "unknown command")
 		return
