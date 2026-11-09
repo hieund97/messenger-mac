@@ -13,7 +13,7 @@ import (
 	"sync"
 	"unsafe"
 
-	"macchat/core/engine"
+	"macmess/core/engine"
 )
 
 var state struct {

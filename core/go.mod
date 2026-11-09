@@ -1,4 +1,4 @@
-module macchat/core
+module macmess/core
 
 go 1.26.0
 

@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"macchat/core/engine"
+	"macmess/core/engine"
 )
 
 func main() {
