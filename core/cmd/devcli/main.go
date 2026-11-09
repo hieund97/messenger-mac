@@ -17,6 +17,7 @@ func main() {
 	platform := flag.String("platform", "messenger", "messenger or facebook")
 	data := flag.String("data", "./devdata", "data directory")
 	duration := flag.Duration("duration", 2*time.Minute, "session duration")
+	redact := flag.Bool("redact", true, "redact message text and attachment refs (-redact=false to show)")
 	flag.Parse()
 	raw, err := os.ReadFile(*cookiePath)
 	if err != nil {
@@ -33,6 +34,22 @@ func main() {
 		list = append(list, engine.Cookie{Name: name, Value: value})
 	}
 	e := engine.New(engine.Config{DataDir: *data, Backend: "meta"}, func(event engine.Event) {
+		if *redact && event.Type == engine.EventMessageUpsert {
+			if message, ok := event.Data.(engine.Message); ok {
+				if message.Text != nil {
+					text := "[redacted]"
+					message.Text = &text
+				}
+				attachments := make([]engine.Attachment, len(message.Attachments))
+				for i, a := range message.Attachments {
+					a.Ref = "[redacted]"
+					a.PreviewURL = nil
+					attachments[i] = a
+				}
+				message.Attachments = attachments
+				event.Data = message
+			}
+		}
 		if event.Type == engine.EventCookiesUpdated {
 			if update, ok := event.Data.(engine.CookiesUpdated); ok {
 				for i := range update.Cookies {

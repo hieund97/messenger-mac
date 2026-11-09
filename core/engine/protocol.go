@@ -43,8 +43,9 @@ type Error struct {
 func (e *Error) Error() string { return e.Message }
 
 type Response struct {
-	OK    bool   `json:"ok"`
-	Error *Error `json:"error,omitempty"`
+	OK    bool            `json:"ok"`
+	Error *Error          `json:"error,omitempty"`
+	Data  json.RawMessage `json:"data,omitempty"`
 }
 type ConnectionState struct {
 	State  string  `json:"state"`

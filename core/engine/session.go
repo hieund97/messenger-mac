@@ -9,11 +9,13 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-meta/pkg/messagix"
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
+	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 )
 
@@ -24,10 +26,16 @@ type metaClient interface {
 	IsConnected() bool
 	SetEventHandler(func(context.Context, any))
 }
-type realMetaClient struct{ *messagix.Client }
+type realMetaClient struct {
+	*messagix.Client
+	initial atomic.Pointer[table.LSTable] // inbox page table, handled once the socket is connected
+}
 
 func (c *realMetaClient) LoadInbox(ctx context.Context) error {
-	_, _, err := c.LoadMessagesPage(ctx)
+	_, tbl, err := c.LoadMessagesPage(ctx)
+	if err == nil && tbl != nil {
+		c.initial.Store(tbl)
+	}
 	return err
 }
 func (c *realMetaClient) SetEventHandler(f func(context.Context, any)) { c.Client.SetEventHandler(f) }
@@ -45,7 +53,18 @@ type MetaBackend struct {
 	logFile            *os.File
 	lastFatalReconnect time.Time
 	newClient          func(*cookies.Cookies, zerolog.Logger) metaClient
+	// Per login: conversations survive reconnects. Per session: e2ee, ctx and connected.
+	index     *ThreadIndex
+	e2ee      *e2eeConn
+	ctx       context.Context
+	connected bool
+	// E2EE-triggered full reconnects back off 1, 2, 5, 10 minutes; reset once E2EE connects.
+	e2eeFullReconnects int
+	lastE2EEReconnect  time.Time
+	icdcFailures       int
 }
+
+var e2eeFullReconnectBackoff = []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute}
 
 func NewMetaBackend(cfg Config) *MetaBackend { return &MetaBackend{cfg: cfg} }
 func (b *MetaBackend) Login(ctx context.Context, args LoginArgs, emit func(Event)) error {
@@ -98,6 +117,8 @@ func (b *MetaBackend) Login(ctx context.Context, args LoginArgs, emit func(Event
 	b.emit = emit
 	b.auth = false
 	b.lastFatalReconnect = time.Time{}
+	b.index = NewThreadIndex(c.GetUserID())
+	b.e2eeFullReconnects, b.lastE2EEReconnect, b.icdcFailures = 0, time.Time{}, 0
 	b.mu.Unlock()
 	return b.startSession(ctx, c, p)
 }
@@ -106,8 +127,9 @@ func (b *MetaBackend) Login(ctx context.Context, args LoginArgs, emit func(Event
 func (b *MetaBackend) startSession(ctx context.Context, c *cookies.Cookies, platform types.Platform) error {
 	var file *os.File
 	log := zerolog.Nop()
+	dir := ""
 	if b.cfg.DataDir != "" {
-		dir := filepath.Join(b.cfg.DataDir, strconv.FormatInt(c.GetUserID(), 10))
+		dir = filepath.Join(b.cfg.DataDir, strconv.FormatInt(c.GetUserID(), 10))
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return err
 		}
@@ -123,14 +145,26 @@ func (b *MetaBackend) startSession(ctx context.Context, c *cookies.Cookies, plat
 	if b.newClient != nil {
 		client = b.newClient(c, log)
 	} else {
-		client = &realMetaClient{messagix.NewClient(c, log, &messagix.Config{})}
+		client = &realMetaClient{Client: messagix.NewClient(c, log, &messagix.Config{})}
 	}
 	sessionCtx, cancel := context.WithCancel(ctx)
 	b.mu.Lock()
+	index := b.index
+	var e2ee *e2eeConn
+	if rc, ok := client.(*realMetaClient); ok && dir != "" && index != nil {
+		// whatsmeow logs through the messagix logger (PrepareE2EEClient), i.e. into the same core.log.
+		e2ee = newE2EEConn(sessionCtx, b, client, rc.Client, index, filepath.Join(dir, "e2ee.db"), log)
+	}
 	b.client = client
 	b.cancel = cancel
 	b.logFile = file
+	b.e2ee = e2ee
+	b.ctx = sessionCtx
+	b.connected = false
 	b.mu.Unlock()
+	if index != nil {
+		index.setLogger(log)
+	}
 	client.SetEventHandler(func(_ context.Context, event any) { b.handleEvent(client, event) })
 	if err := client.LoadInbox(sessionCtx); err != nil {
 		b.failure(client, err)
@@ -167,20 +201,25 @@ func (b *MetaBackend) failure(client metaClient, err error) {
 		b.mu.Unlock()
 		return
 	}
+	var e2ee *e2eeConn
 	if state == "auth_required" {
 		b.auth = true
 		if b.cancel != nil {
 			b.cancel()
 		}
+		e2ee, b.e2ee = b.e2ee, nil
 	}
 	emit := b.emit
 	if emit != nil {
 		emit(Event{Type: EventConnectionState, Data: ConnectionState{State: state, Reason: &reason}})
 	}
 	b.mu.Unlock()
-	// The handler runs on messagix's connection loop, so Disconnect must not wait on itself.
+	// The handler runs on messagix's (or whatsmeow's) event loop, so Disconnect must not wait on itself.
 	if state == "auth_required" {
 		go client.Disconnect()
+		if e2ee != nil {
+			go e2ee.close()
+		}
 	}
 }
 func (b *MetaBackend) handleEvent(client metaClient, event any) {
@@ -188,6 +227,13 @@ func (b *MetaBackend) handleEvent(client metaClient, event any) {
 	case *messagix.ConnectedEvent, *messagix.ReconnectedEvent:
 		b.checkCookies(client)
 		b.state(client, "connected", "")
+		b.onConnected(client)
+	case *table.LSTable:
+		b.handleTable(client, e)
+		// handlemeta.go:248: sync group cursors advance only after the table was handled.
+		if p, ok := client.(interface{ PostHandlePublishResponse(*table.LSTable) }); ok && b.sink(client) != nil {
+			p.PostHandlePublishResponse(e)
+		}
 	case *messagix.TransientDisconnectEvent:
 		b.handleDisconnect(client, e.Err)
 	case *messagix.PermanentErrorEvent:
@@ -198,16 +244,56 @@ func (b *MetaBackend) handleEvent(client metaClient, event any) {
 func (b *MetaBackend) handleDisconnect(client metaClient, err error) {
 	b.failure(client, err)
 	if errors.Is(err, messagix.ErrFatalSocketSyncError) {
-		b.mu.Lock()
-		allowed := b.client == client && !b.auth && time.Since(b.lastFatalReconnect) >= time.Minute
-		if allowed {
-			b.lastFatalReconnect = time.Now()
-		}
-		b.mu.Unlock()
-		if allowed {
-			go b.reconnectAfterFatal(client)
-		}
+		b.scheduleFullReconnect(client)
 	}
+}
+
+// scheduleFullReconnect starts a new session for client at most once per minute. It reports whether
+// a reconnect was started.
+func (b *MetaBackend) scheduleFullReconnect(client metaClient) bool {
+	b.mu.Lock()
+	allowed := b.client == client && !b.auth && time.Since(b.lastFatalReconnect) >= time.Minute
+	if allowed {
+		b.lastFatalReconnect = time.Now()
+	}
+	b.mu.Unlock()
+	if allowed {
+		go b.reconnectAfterFatal(client)
+	}
+	return allowed
+}
+
+// scheduleE2EEFullReconnect is the full reconnect E2EE asks for (CAT refresh, ICDC 401, WA 400).
+// Consecutive ones are spaced by e2eeFullReconnectBackoff; false means the caller retries E2EE only.
+func (b *MetaBackend) scheduleE2EEFullReconnect(client metaClient) bool {
+	b.mu.Lock()
+	allowed := b.client == client && !b.auth
+	if allowed && b.e2eeFullReconnects > 0 {
+		wait := e2eeFullReconnectBackoff[min(b.e2eeFullReconnects-1, len(e2eeFullReconnectBackoff)-1)]
+		allowed = time.Since(b.lastE2EEReconnect) >= wait
+	}
+	if allowed {
+		b.e2eeFullReconnects++
+		b.lastE2EEReconnect = time.Now()
+	}
+	b.mu.Unlock()
+	if allowed {
+		go b.reconnectAfterFatal(client)
+	}
+	return allowed
+}
+
+func (b *MetaBackend) noteICDCFailure() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.icdcFailures++
+	return b.icdcFailures
+}
+
+func (b *MetaBackend) e2eeHealthy() {
+	b.mu.Lock()
+	b.e2eeFullReconnects, b.icdcFailures = 0, 0
+	b.mu.Unlock()
 }
 func (b *MetaBackend) checkCookies(client metaClient) {
 	b.mu.Lock()
@@ -255,7 +341,7 @@ func (b *MetaBackend) watchCookies(ctx context.Context, client metaClient) {
 }
 func (b *MetaBackend) stop() {
 	b.mu.Lock()
-	c, cancel, file := b.client, b.cancel, b.logFile
+	c, cancel, file, e2ee := b.client, b.cancel, b.logFile, b.e2ee
 	b.client = nil
 	b.cookies = nil
 	b.snapshot = nil
@@ -263,12 +349,18 @@ func (b *MetaBackend) stop() {
 	b.cancel = nil
 	b.logFile = nil
 	b.auth = false
+	b.index = nil
+	b.e2ee = nil
+	b.ctx = nil
 	b.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	if c != nil {
 		go c.Disconnect()
+	}
+	if e2ee != nil {
+		e2ee.closeAsync()
 	}
 	if file != nil {
 		_ = file.Close()
@@ -318,14 +410,17 @@ func (b *MetaBackend) reconnect(ctx context.Context, expected metaClient) error 
 		b.mu.Unlock()
 		return nil
 	}
-	cancel, file := b.cancel, b.logFile
-	b.client, b.cancel, b.logFile = nil, nil, nil
+	cancel, file, e2ee := b.cancel, b.logFile, b.e2ee
+	b.client, b.cancel, b.logFile, b.e2ee, b.ctx = nil, nil, nil, nil, nil
 	b.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	if client != nil {
 		go client.Disconnect()
+	}
+	if e2ee != nil {
+		e2ee.closeAsync()
 	}
 	if file != nil {
 		_ = file.Close()
@@ -337,9 +432,6 @@ func (*MetaBackend) RestoreHistory(context.Context, RestoreHistoryArgs, func(Eve
 	return notImplemented()
 }
 func (*MetaBackend) SkipHistoryRestore(context.Context, SkipHistoryRestoreArgs, func(Event)) error {
-	return notImplemented()
-}
-func (*MetaBackend) ListConversations(context.Context, ListConversationsArgs, func(Event)) error {
 	return notImplemented()
 }
 func (*MetaBackend) FetchMessages(context.Context, FetchMessagesArgs, func(Event)) error {

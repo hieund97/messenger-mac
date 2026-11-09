@@ -15,7 +15,7 @@ let package = Package(
     targets: [
         .binaryTarget(name: "MessengerCore", path: "../core/build/MessengerCore.xcframework"),
         .target(name: "CoreBridge", dependencies: ["MessengerCore"],
-                linkerSettings: [.linkedLibrary("resolv"), .linkedFramework("CoreFoundation"), .linkedFramework("Security")]),
+                linkerSettings: [.linkedLibrary("resolv"), .linkedLibrary("sqlite3"), .linkedFramework("CoreFoundation"), .linkedFramework("Security")]),
         .testTarget(name: "CoreBridgeTests", dependencies: ["CoreBridge"]),
         .target(name: "CookieImport", dependencies: [.product(name: "GRDB", package: "GRDB.swift")],
                 linkerSettings: [.linkedFramework("Security")]),

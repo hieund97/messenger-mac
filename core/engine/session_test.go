@@ -10,6 +10,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/loginerrors"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
+	waEvents "go.mau.fi/whatsmeow/types/events"
 	"sync"
 	"testing"
 	"time"
@@ -200,5 +201,51 @@ func TestTooManyRedirectsIsNetwork(t *testing.T) {
 	s, c := classifyError(httpclient.ErrTooManyRedirects)
 	if s != "disconnected" || c != "network" {
 		t.Fatal(s, c)
+	}
+}
+
+func TestE2EEFailuresNeverRequireAuth(t *testing.T) {
+	b := NewMetaBackend(Config{})
+	client := &testMetaClient{}
+	var mu sync.Mutex
+	var got []Event
+	b.client = client
+	b.emit = func(e Event) { mu.Lock(); got = append(got, e); mu.Unlock() }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e := newE2EEConn(ctx, b, client, nil, NewThreadIndex(1), "", zerolog.Nop())
+	e.reset = true // the one re-registration of this session is already used
+	defer e.close()
+	for _, evt := range []any{&waEvents.LoggedOut{}, &waEvents.ClientOutdated{}, &waEvents.TemporaryBan{},
+		&waEvents.ConnectFailure{Reason: waEvents.ConnectFailureNotFound}, &waEvents.StreamReplaced{}} {
+		if !e.handle(nil, evt) {
+			t.Fatalf("%T not acked", evt)
+		}
+	}
+	mu.Lock()
+	codes := []string{}
+	for _, ev := range got {
+		if ev.Type != EventError {
+			t.Fatalf("unexpected event %+v", ev)
+		}
+		codes = append(codes, ev.Data.(ErrorEvent).Code)
+	}
+	mu.Unlock()
+	if len(codes) != 2 || codes[0] != "e2ee_unavailable" || codes[1] != "e2ee_stream_replaced" {
+		t.Fatal(codes)
+	}
+	if b.auth {
+		t.Fatal("E2EE failure switched the session to auth_required")
+	}
+	if s, _ := classifyError(errors.New("e2ee device logged out")); s == "auth_required" {
+		t.Fatal(s)
+	}
+
+	// With no live session a message is not acked, so the server delivers it again.
+	b.mu.Lock()
+	b.client = nil
+	b.mu.Unlock()
+	if e.handle(nil, &waEvents.FBMessage{}) {
+		t.Fatal("message acked without a session")
 	}
 }

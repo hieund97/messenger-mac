@@ -7,6 +7,13 @@ require go.mau.fi/mautrix-meta v0.2610.1-0.20261108210514-a8ffd21e968b
 require github.com/rs/zerolog v1.35.1
 
 require (
+	github.com/google/uuid v1.6.0
+	github.com/mattn/go-sqlite3 v1.14.52
+	go.mau.fi/whatsmeow v0.0.0-20261027104441-1eec1136a50b
+	google.golang.org/protobuf v1.36.12
+)
+
+require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/andybalholm/brotli v1.2.4 // indirect
 	github.com/armfazh/h2c-go-ref v0.0.0-20210215173008-07e12a6f8e0d // indirect
@@ -20,7 +27,6 @@ require (
 	github.com/coreos/go-systemd/v22 v22.7.0 // indirect
 	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/gtank/ristretto255 v0.2.0 // indirect
 	github.com/icholy/digest v1.2.0 // indirect
 	github.com/imroc/req/v3 v3.56.0 // indirect
@@ -42,7 +48,6 @@ require (
 	github.com/yuin/goldmark v1.8.6 // indirect
 	go.mau.fi/libsignal v0.2.3-0.20261103023201-5ce3f7a54370 // indirect
 	go.mau.fi/util v0.11.1-0.20261026174803-9e6b9c87cfbc // indirect
-	go.mau.fi/whatsmeow v0.0.0-20261027104441-1eec1136a50b // indirect
 	go.mau.fi/zeroconfig v0.2.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
@@ -50,7 +55,6 @@ require (
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
-	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	maunium.net/go/mautrix v0.32.1-0.20261105233647-a3fe62a69fe2 // indirect
