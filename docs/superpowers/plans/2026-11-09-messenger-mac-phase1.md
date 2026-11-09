@@ -4,7 +4,7 @@
 
 **Goal:** App macOS native (SwiftUI) để nhắn tin Messenger 1-1, gồm text, ảnh, file, thông báo, có hỗ trợ E2EE và khôi phục lịch sử bằng PIN.
 
-**Architecture:** Lõi Go `MessengerCore` bọc `messagix` + `whatsmeow`, build `-buildmode=c-archive` thành `MessengerCore.xcframework` (arm64 + x86_64). Swift gọi qua C API: lệnh JSON đi vào, sự kiện JSON trả ra qua callback. Logic Swift nằm trong SwiftPM package `MessengerKit` để chạy `swift test`. App được build bằng SwiftPM rồi đóng thành `.app` bằng script, không cần Xcode.
+**Architecture:** Lõi Go `MessengerCore` bọc `messagix` + `whatsmeow`, build `-buildmode=c-archive` thành `MessengerCore.xcframework` (arm64 + x86_64). Swift gọi qua C API: lệnh JSON đi vào, sự kiện JSON trả ra qua callback. Logic Swift nằm trong SwiftPM package `MessengerKit` để chạy test bằng `make kit-test`. App được build bằng SwiftPM rồi đóng thành `.app` bằng script, không cần Xcode.
 
 **Tech Stack:** Go ≥ 1.26, `go.mau.fi/mautrix-meta` @ `a8ffd21`, `go.mau.fi/whatsmeow`, Swift 6.2, SwiftUI, macOS 14+, GRDB 7, Sparkle 2, `create-dmg`.
 
@@ -22,7 +22,8 @@
 - `client_id` do Swift tạo, giữ nguyên khi retry. Lõi dùng nó làm OTID/message ID. Không tự gửi lại khi trạng thái là `unknown`.
 - Backfill chỉ chạy khi người dùng cuộn lên. Mỗi batch cách nhau ≥ 1 giây.
 - Commit message không có dòng Co-Authored-By Claude.
-- Máy dev chỉ có Command Line Tools, không có Xcode. Mọi bước build phải chạy được bằng `go`, `swift build`, `swift test` và script.
+- Máy dev chỉ có Command Line Tools, không có Xcode. Mọi bước build phải chạy được bằng `go`, `swift build` và script.
+- Không có XCTest. Test Swift viết bằng swift-testing (`import Testing`, `@Test`, `#expect`) và chạy bằng `make kit-test [FILTER=...]`. Không chạy `swift test` trần (thiếu flag framework của CLT). Không đưa flag test vào `Package.swift`, vì như vậy test chạy 0 case mà vẫn báo pass.
 
 ## Phân công agent
 
@@ -88,8 +89,8 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
   ```
 
 - [ ] **Step 1:** `git init`, tạo các file trên. `capi.go` tạm cài 4 hàm rỗng: `core_init` trả 0, `core_call` trả 1.
-- [ ] **Step 2:** Viết test `SmokeTests.testInitReturnsZero`: `XCTAssertEqual(core_init("{}", nil), 0)`.
-- [ ] **Step 3:** Chạy `make core && cd MessengerKit && swift test`. Kỳ vọng: PASS.
+- [ ] **Step 2:** Viết test `SmokeTests.testInitReturnsZero`: `#expect(core_init("{}", nil) == 0)`.
+- [ ] **Step 3:** Chạy `make core kit-test`. Kỳ vọng: PASS.
 - [ ] **Step 4:** `make app`. Kỳ vọng: `build/MacChat.app` mở được, hiện một cửa sổ trống. Kiểm tra bằng `lipo -archs build/MacChat.app/Contents/MacOS/MacChat`, kết quả phải là `x86_64 arm64`.
 - [ ] **Step 5:** Commit `chore: khởi tạo repo MacChat với build lõi Go universal và app SwiftPM`.
 
@@ -116,7 +117,7 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 - [ ] **Step 3:** Cài `protocol.go`, `engine.go` (dispatch chạy trên goroutine, mỗi lệnh một goroutine, `emit` an toàn khi gọi đồng thời), `fake_backend.go`. `capi.go` giữ callback C, chuyển event thành `C.CString` rồi gọi callback. Phía Swift copy chuỗi rồi gọi `core_free`.
 - [ ] **Step 4:** `go test ./engine/... -race`. Kỳ vọng: PASS.
 - [ ] **Step 5:** Viết test Swift `BridgeRoundTripTests.testFakeLoginFlow`: init với `{"backend":"fake"}`, gọi `login`, đợi `events` nhận `connected` và 2 `conversationUpsert` (timeout 2 giây).
-- [ ] **Step 6:** `make core && cd MessengerKit && swift test`. Kỳ vọng: PASS.
+- [ ] **Step 6:** `make core kit-test`. Kỳ vọng: PASS.
 - [ ] **Step 7:** Commit `feat(core): thêm giao thức lệnh/sự kiện JSON, C API và backend giả để test`.
 
 ### Task 3: Lõi — phiên đăng nhập, reconnect, lỗi auth
@@ -202,7 +203,7 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 - `CookieImporter.importSession(profile) throws -> [Cookie]`: thiếu `c_user`, `xs` hoặc `datr` ở cả hai domain thì ném `.notLoggedIn`. Người dùng Deny Keychain thì ném `.keychainDenied`. DB không đọc được thì ném `.databaseUnreadable`.
 
 - [ ] **Step 1:** Viết test: `testDecryptKnownVectorV10` (vector tạo trong test bằng CommonCrypto với password `"peanuts"`), `testStripsDomainHashWhenMetaVersion24`, `testPrefersMessengerDomain`, `testMissingXsThrowsNotLoggedIn`, `testLockedDatabaseIsCopiedNotOpenedInPlace` (fixture SQLite đang mở bởi một connection khác vẫn đọc được), `testKeychainDeniedMapsToError` (inject `KeychainReading` giả trả `errSecAuthFailed`).
-- [ ] **Step 2:** `swift test --filter CookieImportTests`. Kỳ vọng: FAIL.
+- [ ] **Step 2:** `make kit-test FILTER=CookieImportTests`. Kỳ vọng: FAIL.
 - [ ] **Step 3:** Cài. Đọc Keychain bằng `SecItemCopyMatching` qua protocol `KeychainReading` để test inject được. Đọc SQLite bằng GRDB.
 - [ ] **Step 4:** Chạy test. Kỳ vọng: PASS.
 - [ ] **Step 5:** Commit `feat(kit): đọc và giải mã cookie đăng nhập từ Chrome/Arc/Brave/Edge theo profile`.
@@ -220,7 +221,7 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 - `send` thêm tin optimistic `status=.sending` với `client_id = UUID()`. `retry` dùng lại `client_id` cũ.
 
 - [ ] **Step 1:** Viết test (dùng backend giả của lõi): `testOptimisticReplacedByServerMessage`, `testDuplicateUpsertKeepsOneRow`, `testUnknownStatusShownAndNotAutoRetried`, `testRetryReusesClientID`, `testUnreadCountDecrementsOnMarkRead`, `testCookiesUpdatedPersistedToKeychain` (Keychain giả).
-- [ ] **Step 2:** `swift test --filter 'LocalStoreTests|AppStateTests'`. Kỳ vọng: FAIL.
+- [ ] **Step 2:** `make kit-test FILTER='LocalStoreTests|AppStateTests'`. Kỳ vọng: FAIL.
 - [ ] **Step 3:** Cài.
 - [ ] **Step 4:** Chạy test. Kỳ vọng: PASS.
 - [ ] **Step 5:** Commit `feat(kit): lưu hội thoại/tin nhắn bằng GRDB và trạng thái app hợp nhất sự kiện từ lõi`.

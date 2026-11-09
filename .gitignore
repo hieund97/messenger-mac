@@ -7,3 +7,5 @@ spike/bin/
 spike-data/
 .DS_Store
 *.log
+core/build/
+.swiftpm/

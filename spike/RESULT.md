@@ -1,6 +1,6 @@
 # Kết quả spike
 
-Chưa hoàn thành: CLI và c-archive arm64 build được; SwiftPM bị chặn khi chạy manifest (`sandbox-exec: sandbox_apply: Operation not permitted`) trong môi trường hiện tại. Chưa xác minh harness, callback, đăng nhập hay nhận tin thực tế. `libspike.a`: 60.142.560 byte (khoảng 57 MiB). Không chạy kết nối thật.
+Đã hoàn thành, cổng Task 0 đạt. Kết quả chạy thật ở cuối file. `libspike.a` bản arm64: 60.142.560 byte.
 
 ## Chạy thử sau khi xử lý môi trường
 
