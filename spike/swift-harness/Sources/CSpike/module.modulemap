@@ -1,0 +1,4 @@
+module CSpike [system] {
+    header "../../../bin/libspike.h"
+    export *
+}

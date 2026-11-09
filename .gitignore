@@ -1,0 +1,8 @@
+cookies.json
+*.db
+*.db-*
+build/
+.build/
+spike/bin/
+spike-data/
+.DS_Store
