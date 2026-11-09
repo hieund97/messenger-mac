@@ -14,6 +14,7 @@ const (
 	CmdSendMedia             = "send_media"
 	CmdMarkRead              = "mark_read"
 	CmdDownloadMedia         = "download_media"
+	EventCookiesUpdated      = "cookies_updated"
 	EventResponse            = "response"
 	EventConnectionState     = "connection_state"
 	EventHistoryRestoreState = "history_restore_state"
@@ -105,7 +106,7 @@ type Cookie struct {
 	Name    string `json:"name"`
 	Value   string `json:"value"`
 	Domain  string `json:"domain"`
-	Expires int64  `json:"expires"`
+	Expires int64  `json:"expires,omitempty"`
 }
 type LoginArgs struct {
 	Cookies  []Cookie `json:"cookies"`
@@ -143,4 +144,8 @@ type MarkReadArgs struct {
 type DownloadMediaArgs struct {
 	AttachmentRef string `json:"attachment_ref"`
 	DestPath      string `json:"dest_path"`
+}
+
+type CookiesUpdated struct {
+	Cookies []Cookie `json:"cookies"`
 }

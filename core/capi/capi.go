@@ -36,7 +36,7 @@ func core_init(configJSON *C.char, cb C.core_event_cb) C.int32_t {
 	if configJSON == nil || json.Unmarshal([]byte(C.GoString(configJSON)), &cfg) != nil {
 		return -1
 	}
-	if cfg.Backend != "fake" {
+	if cfg.Backend != "fake" && cfg.Backend != "" && cfg.Backend != "meta" {
 		return -2
 	}
 	state.engine = engine.New(cfg, func(event engine.Event) {

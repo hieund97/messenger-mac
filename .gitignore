@@ -9,3 +9,4 @@ spike-data/
 *.log
 core/build/
 .swiftpm/
+core/devdata/

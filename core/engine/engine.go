@@ -47,6 +47,8 @@ func New(cfg Config, emit func(Event)) *Engine {
 	e := &Engine{emit: emit, ctx: ctx, cancel: cancel}
 	if cfg.Backend == "fake" {
 		e.backend = FakeBackend{}
+	} else if cfg.Backend == "" || cfg.Backend == "meta" {
+		e.backend = NewMetaBackend(cfg)
 	}
 	return e
 }
@@ -85,6 +87,9 @@ func (e *Engine) Shutdown() {
 	select {
 	case <-done:
 	case <-timer.C:
+	}
+	if backend, ok := e.backend.(*MetaBackend); ok {
+		_ = backend.Logout(context.Background(), LogoutArgs{}, nil)
 	}
 	e.emitMu.Lock()
 	e.stopped = true
