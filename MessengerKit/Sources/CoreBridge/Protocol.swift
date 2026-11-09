@@ -102,12 +102,22 @@ public struct ConnectionState: Codable, Sendable, Equatable {
     public var state: String
     public var reason: String?
 
+    public init(state: String, reason: String? = nil) {
+        self.state = state
+        self.reason = reason
+    }
+
     enum CodingKeys: String, CodingKey { case state, reason }
 }
 
 public struct HistoryRestoreState: Codable, Sendable, Equatable {
     public var state: String
     public var reason: String?
+
+    public init(state: String, reason: String? = nil) {
+        self.state = state
+        self.reason = reason
+    }
 
     enum CodingKeys: String, CodingKey { case state, reason }
 }
@@ -117,6 +127,13 @@ public struct MessageSendResult: Codable, Sendable, Equatable {
     public var status: String
     public var messageID: String?
     public var error: CoreError?
+
+    public init(clientID: String, status: String, messageID: String? = nil, error: CoreError? = nil) {
+        self.clientID = clientID
+        self.status = status
+        self.messageID = messageID
+        self.error = error
+    }
 
     enum CodingKeys: String, CodingKey {
         case clientID = "client_id"
@@ -148,6 +165,18 @@ public struct Conversation: Codable, Sendable, Equatable {
     public var unreadCount: Int
     public var historyRestored: Bool
 
+    public init(id: String, peerID: String, name: String, avatarURL: String? = nil, lastMessagePreview: String? = nil,
+                lastActivityTS: Int64 = 0, unreadCount: Int = 0, historyRestored: Bool = true) {
+        self.id = id
+        self.peerID = peerID
+        self.name = name
+        self.avatarURL = avatarURL
+        self.lastMessagePreview = lastMessagePreview
+        self.lastActivityTS = lastActivityTS
+        self.unreadCount = unreadCount
+        self.historyRestored = historyRestored
+    }
+
     enum CodingKeys: String, CodingKey {
         case id
         case peerID = "peer_id"
@@ -170,10 +199,27 @@ public struct Attachment: Codable, Sendable, Equatable {
     public var height: Int?
     public var previewURL: String?
 
+    public init(ref: String, kind: String, mime: String, filename: String? = nil, size: Int64? = nil,
+                width: Int? = nil, height: Int? = nil, previewURL: String? = nil) {
+        self.ref = ref
+        self.kind = kind
+        self.mime = mime
+        self.filename = filename
+        self.size = size
+        self.width = width
+        self.height = height
+        self.previewURL = previewURL
+    }
+
     enum CodingKeys: String, CodingKey {
         case ref, kind, mime, filename, size, width, height
         case previewURL = "preview_url"
     }
+}
+
+/// Trạng thái gửi, chỉ có ở phía app (không nằm trong JSON của lõi). Tin nhận từ lõi mặc định `.sent`.
+public enum MessageStatus: String, Sendable, Equatable {
+    case sending, sent, failed, unknown
 }
 
 public struct Message: Codable, Sendable, Equatable {
@@ -188,6 +234,25 @@ public struct Message: Codable, Sendable, Equatable {
     public var clientID: String?
     public var attachments: [Attachment]
     public var replyToID: String?
+    /// Không mã hóa/giải mã: lõi không biết trạng thái gửi của app.
+    public var status: MessageStatus = .sent
+
+    public init(id: String, conversationID: String, threadID: String, e2ee: Bool = false, senderID: String,
+                isOutgoing: Bool, ts: Int64, text: String? = nil, clientID: String? = nil,
+                attachments: [Attachment] = [], replyToID: String? = nil, status: MessageStatus = .sent) {
+        self.id = id
+        self.conversationID = conversationID
+        self.threadID = threadID
+        self.e2ee = e2ee
+        self.senderID = senderID
+        self.isOutgoing = isOutgoing
+        self.ts = ts
+        self.text = text
+        self.clientID = clientID
+        self.attachments = attachments
+        self.replyToID = replyToID
+        self.status = status
+    }
 
     enum CodingKeys: String, CodingKey {
         case id

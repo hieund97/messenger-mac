@@ -162,6 +162,7 @@ Mục đích: chứng minh `messagix` + `whatsmeow` chạy được khi nhúng q
 - Tham khảo: `pkg/connector/handlematrix.go:68-200, 613`, `pkg/messagix/httpclient/mercury.go`, `pkg/msgconv/to-whatsapp.go:284`, `pkg/connector/directmedia.go`
 
 **Interfaces:**
+- Tin của chính mình gửi từ app, khi lõi phát lại qua `message_upsert` (echo), phải mang `client_id` gốc, và `message_send_result.message_id` phải trùng `id` của echo. Không đạt điều này thì AppState hiện tin 2 lần.
 - Produces: `func otidFromClientID(clientID string) int64`, xác định duy nhất từ `client_id` (dùng hash 63 bit). `const maxUploadBytes = 25 * 1024 * 1024`.
 - Kết quả gửi: thấy `LSReplaceOptimsiticMessage` khớp OTID hoặc ack E2EE thì `sent`. Thấy `LSMarkOptimisticMessageFailed`/`LSHandleFailedTask` thì `failed`. Sau 30 giây không có xác nhận hoặc đứt kết nối sau khi đã ghi task thì `unknown`.
 

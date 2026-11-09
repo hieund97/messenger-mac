@@ -7,7 +7,8 @@ public enum CoreBridgeError: Error, Sendable, Equatable {
     case alreadyInitialized   // -3 hoặc đã có bridge đang chạy
     case shuttingDown         // -4
     case unknownInitCode(Int32)
-    case notRunning           // core_call = -1, hoặc bridge đã shutdown
+    case notRunning           // core_call = -1, hoặc bridge đã shutdown trước khi đăng ký call (lệnh chắc chắn chưa tới lõi)
+    case closedWhilePending   // call đã đăng ký với lõi rồi bridge bị shutdown (không biết lõi đã xử lý chưa)
     case encodingFailed
 }
 
@@ -118,7 +119,7 @@ private final class Hub: Sendable {
             s.pending = [:]
             return p
         }
-        for c in pending { c.resume(throwing: CoreBridgeError.notRunning) }
+        for c in pending { c.resume(throwing: CoreBridgeError.closedWhilePending) }
         eventContinuation.finish()
     }
 }
