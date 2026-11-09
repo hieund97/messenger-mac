@@ -91,7 +91,8 @@ struct ChatView: View {
             sendFiles(urls)
             return !urls.isEmpty
         } isTargeted: { dropTargeted = $0 }
-        .navigationTitle(conversation.name)
+        // Tên hội thoại đã có ở header của khung chat: bỏ tiêu đề cửa sổ để khỏi hiện hai lần.
+        .navigationTitle("")
         .task {
             await state.open(conversationID: conversation.id)
             opened = true

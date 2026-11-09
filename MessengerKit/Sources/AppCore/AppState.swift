@@ -31,6 +31,8 @@ public final class AppState {
     public static let maxFileSize: Int64 = 25 * 1024 * 1024
     /// Số tin cuối nạp vào cache khi mở hội thoại.
     public static let windowSize = 50
+    /// Dung sai lệch đồng hồ (ms) khi so ts tin với `connectedAt`.
+    static let clockSkewTolerance: Int64 = 5_000
     /// Khoảng cách tối thiểu giữa hai batch `loadOlder` của cùng hội thoại.
     public static let olderBatchInterval: Duration = .seconds(1)
 
@@ -39,6 +41,8 @@ public final class AppState {
     public private(set) var historyRestore = HistoryRestoreState(state: "none")
     public private(set) var loginError: (any Error)?
     public private(set) var lastError: CoreError?
+    /// Thời điểm (ms, đã trừ dung sai 5 giây) kết nối chuyển sang `connected` gần nhất; 0 nếu chưa kết nối.
+    public private(set) var connectedAt: Int64 = 0
 
     @ObservationIgnored private var store: LocalStore?
     @ObservationIgnored private let storeFactory: @Sendable (String) throws -> LocalStore
@@ -64,6 +68,10 @@ public final class AppState {
     /// Task của lệnh gần nhất (test dùng để chờ).
     @ObservationIgnored var lastCall: Task<Void, Never>?
     private var messageCache: [String: [Message]] = [:]
+    /// ts lớn nhất đã thấy theo hội thoại trong phiên này.
+    @ObservationIgnored private var knownTS: [String: Int64] = [:]
+    /// ts cuối đã biết của hội thoại ngay trước khi nhận tin (theo id tin), cho `NotificationPolicy`.
+    @ObservationIgnored private var knownTSBefore: [String: Int64] = [:]
 
     /// `storeFactory` nhận c_user và trả store của tài khoản đó; mặc định là store in-memory (tin nhắn không ghi ra đĩa).
     public init(storeFactory: (@Sendable (String) throws -> LocalStore)? = nil,
@@ -126,6 +134,18 @@ public final class AppState {
             Task { @MainActor in self?.observers[id] = nil }
         }
         return stream
+    }
+
+    /// ts cuối đã biết của hội thoại tại thời điểm tin này đến. Hội thoại chưa có tin nào trong phiên
+    /// (đang nạp backlog đầu tiên) trả `Int64.max` để tin cũ không bị coi là mới.
+    public func lastKnownTS(before message: Message) -> Int64 {
+        knownTSBefore[message.id] ?? .max
+    }
+
+    /// Yêu cầu lõi kết nối lại (sau wake/mạng trở lại). Bỏ qua khi chưa đăng nhập hoặc cần đăng nhập lại.
+    public func reconnect() {
+        guard let link, isLoggedIn, !connection.isAuthRequired else { return }
+        lastCall = Task { _ = try? await link.call(.reconnect) }
     }
 
     // MARK: Đăng nhập
@@ -380,12 +400,24 @@ public final class AppState {
     func apply(_ event: CoreEvent) async {
         switch event {
         case .connectionState(let s):
+            if s.state == "connected", connection.state != "connected" {
+                // Mốc "đã biết" của hội thoại chưa có tin nào trong phiên = hoạt động cuối trước lần kết nối này,
+                // để tin bị lỡ lúc ngủ (mới hơn mốc) vẫn được báo còn backlog cũ thì không.
+                for c in conversations where knownTS[c.id] == nil { knownTS[c.id] = c.lastActivityTS }
+                // Trừ 5 giây dung sai lệch đồng hồ giữa máy và server.
+                connectedAt = Int64(Date().timeIntervalSince1970 * 1000) - Self.clockSkewTolerance
+            }
             connection = s
         case .historyRestoreState(let s):
             historyRestore = s
         case .conversationUpsert(let c):
             if let store, let stored = try? await store.upsert(c) { put(stored) }
         case .messageUpsert(let m):
+            if knownTSBefore[m.id] == nil {
+                if knownTSBefore.count > 500 { knownTSBefore.removeAll() }
+                knownTSBefore[m.id] = knownTS[m.conversationID] ?? .max
+            }
+            knownTS[m.conversationID] = max(knownTS[m.conversationID] ?? 0, m.ts)
             if let store, let change = try? await store.upsert(m) { patch(change) }
         case .messageSendResult(let r):
             let status = MessageStatus(rawValue: r.status) ?? .unknown
@@ -491,6 +523,9 @@ public final class AppState {
         store = nil
         conversations = []
         messageCache = [:]
+        knownTS = [:]
+        knownTSBefore = [:]
+        connectedAt = 0
         historyRestore = HistoryRestoreState(state: "none")
         isLoggedIn = false
         exhausted = []

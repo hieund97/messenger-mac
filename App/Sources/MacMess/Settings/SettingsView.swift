@@ -1,4 +1,5 @@
 import AppCore
+import ServiceManagement
 import SwiftUI
 
 struct SettingsView: View {
@@ -10,6 +11,8 @@ struct SettingsView: View {
     @State private var showPicker = false
     @State private var showRisk = false
     @State private var confirmLogout = false
+    @State private var launchError: String?
+    @State private var needsApproval = false
 
     var body: some View {
         Form {
@@ -24,10 +27,24 @@ struct SettingsView: View {
             }
             Section("Hệ thống") {
                 Toggle("Mở khi đăng nhập macOS", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { _, enabled in
+                        guard enabled != Lifecycle.launchAtLoginOn else { return }
+                        launchError = Lifecycle.setLaunchAtLogin(enabled)
+                        refreshLoginItem()
+                    }
+                if needsApproval {
+                    Text("Cho phép trong System Settings → General → Login Items.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Mở Login Items…") { SMAppService.openSystemSettingsLoginItems() }
+                }
+                if let launchError {
+                    Text(launchError).font(.caption).foregroundStyle(.red)
+                }
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: 340)
+        .onAppear { refreshLoginItem() }
+        .frame(width: 440, height: 400)
         .sheet(isPresented: $showPIN) {
             PINEntryView(onSkip: { showPIN = false })
         }
@@ -53,5 +70,11 @@ struct SettingsView: View {
         } message: {
             Text("Cookie phiên đăng nhập sẽ bị xóa khỏi Keychain.")
         }
+    }
+
+    /// Toggle phản ánh đúng trạng thái hệ thống (enabled hoặc requiresApproval = bật).
+    private func refreshLoginItem() {
+        launchAtLogin = Lifecycle.launchAtLoginOn
+        needsApproval = Lifecycle.launchAtLoginNeedsApproval
     }
 }

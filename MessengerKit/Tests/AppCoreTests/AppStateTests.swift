@@ -29,6 +29,31 @@ struct AppStateTests {
         #expect(state.messages(for: "u:1").map(\.status) == [.unknown])
     }
 
+    @Test func testMissedMessageDuringSleepNotifies() async throws {
+        let (state, _, _) = try await loggedInState()
+        let t1 = nowMillis() - 60_000
+        await state.apply(.connectionState(ConnectionState(state: "connected")))
+        await state.apply(.conversationUpsert(Conversation(id: "u:1", peerID: "1", name: "Alice", lastActivityTS: t1, unreadCount: 0)))
+        await state.apply(.connectionState(ConnectionState(state: "disconnected")))
+        await state.apply(.connectionState(ConnectionState(state: "connected")))
+
+        // Tin đến lúc ngủ: sau tin cuối đã biết (t1), trước lúc kết nối lại.
+        let missed = Message(id: "m-missed", conversationID: "u:1", threadID: "u:1", senderID: "1",
+                             isOutgoing: false, ts: t1 + 30_000, text: "missed")
+        // Backlog cũ: không mới hơn t1.
+        let old = Message(id: "m-old", conversationID: "u:1", threadID: "u:1", senderID: "1",
+                          isOutgoing: false, ts: t1 - 1_000, text: "old")
+        await state.apply(.messageUpsert(missed))
+        await state.apply(.messageUpsert(old))
+        func notify(_ m: Message) -> Bool {
+            NotificationPolicy.shouldNotify(message: m, activeConversationID: nil, appIsActive: false,
+                                            connectedAt: state.connectedAt, lastKnownTs: state.lastKnownTS(before: m))
+        }
+        #expect(state.connectedAt > missed.ts)
+        #expect(notify(missed) == true)
+        #expect(notify(old) == false)
+    }
+
     @Test func testRetryReusesClientID() async throws {
         let (state, link, _) = try await loggedInState()
         await state.open(conversationID: "u:1")

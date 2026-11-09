@@ -120,3 +120,5 @@ func safeDownloadResult(_ filename: String?, existing: [String] = []) -> (name: 
     guard let url = try? moveWithUniqueName(from: src, toDirectory: dir, filename: filename) else { return ("", false) }
     return (url.lastPathComponent, url.deletingLastPathComponent().standardizedFileURL == dir.standardizedFileURL)
 }
+
+func nowMillis() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }

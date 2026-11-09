@@ -28,24 +28,32 @@ let isFakeMode = ProcessInfo.processInfo.environment["MACMESS_FAKE"] == "1"
 
 @main
 struct MacMessApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var state: AppState
-    @State private var flow = UIFlow()
+    @State private var flow: UIFlow
 
     init() {
+        let appState: AppState
         if isFakeMode {
             // Dữ liệu fake tách hẳn: thư mục tạm, Keychain service riêng, lastUserID riêng.
-            _state = State(initialValue: AppState(
+            appState = AppState(
                 session: SessionStore(service: "dev.hieund.macmess.fake"),
                 backend: "fake",
                 defaults: UserDefaults(suiteName: "dev.hieund.macmess.fake") ?? .standard,
-                dataDir: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacMess-fake")))
+                dataDir: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("MacMess-fake"))
         } else {
-            _state = State(initialValue: AppState(backend: "meta"))
+            appState = AppState(backend: "meta")
         }
+        let uiFlow = UIFlow()
+        _state = State(initialValue: appState)
+        _flow = State(initialValue: uiFlow)
+        Notifier.shared.start(state: appState, flow: uiFlow)
+        Lifecycle.shared.onMainWindowClosed = { [weak uiFlow] in uiFlow?.selectedConversationID = nil }
+        Lifecycle.shared.start(state: appState)
     }
 
     var body: some Scene {
-        WindowGroup {
+        Window("MacMess", id: Lifecycle.windowID) {
             RootView()
                 .onAppear {
                     // Chạy binary trực tiếp thì cửa sổ nằm sau terminal: ép lên foreground.
@@ -67,6 +75,7 @@ struct MacMessApp: App {
 struct RootView: View {
     @Environment(AppState.self) private var state
     @Environment(UIFlow.self) private var flow
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Group {
@@ -77,6 +86,8 @@ struct RootView: View {
             case .main: MainView()
             }
         }
+        .background(WindowAccessor())
+        .onAppear { Lifecycle.shared.register { openWindow(id: Lifecycle.windowID) } }
         .task(id: flow.step == .resuming) {
             guard flow.step == .resuming else { return }
             let outcome = await state.resumeSavedSession()
