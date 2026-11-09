@@ -11,3 +11,7 @@ core/build/
 .swiftpm/
 core/devdata/
 docs/screenshots/
+build/*.dmg
+*.key
+*.p12
+*.bak

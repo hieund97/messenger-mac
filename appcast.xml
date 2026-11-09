@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Mẫu appcast Sparkle. App đọc file này tại
+  https://github.com/hieund97/messenger-mac/releases/latest/download/appcast.xml
+  Mỗi lần phát hành:
+  1. Chạy scripts/release.sh <version>, lấy đoạn <item> nó in ra.
+  2. Thêm item mới lên đầu danh sách (giữ các item cũ nếu muốn cho phép cập nhật từ bản xa).
+  3. Upload build/MacMess-<version>.dmg và appcast.xml này vào GitHub release v<version>.
+  Channel đang rỗng cho tới khi có bản phát hành đầu tiên.
+-->
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+    <channel>
+        <title>MacMess</title>
+    </channel>
+</rss>

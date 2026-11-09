@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Chứng chỉ tự ký/ad-hoc không có Team ID nên hardened runtime sẽ chặn nạp Sparkle.framework nếu không tắt library validation. -->
+	<key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict>
+</plist>

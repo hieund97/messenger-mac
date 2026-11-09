@@ -1,5 +1,7 @@
 import AppCore
+import Combine
 import CookieImport
+import Sparkle
 import SwiftUI
 
 /// Trạng thái điều hướng của UI (không thuộc AppCore).
@@ -31,6 +33,20 @@ struct MacMessApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var state: AppState
     @State private var flow: UIFlow
+    /// Tự cập nhật qua Sparkle. Chỉ tạo khi chạy từ .app đã phát hành (có khóa công khai, không phải bản dev/fake).
+    private let updaterController: SPUStandardUpdaterController? = Self.makeUpdater()
+
+    private static func makeUpdater() -> SPUStandardUpdaterController? {
+        let info = Bundle.main.infoDictionary
+        let key = info?["SUPublicEDKey"] as? String ?? ""
+        let build = info?["CFBundleVersion"] as? String ?? ""
+        guard !isFakeMode,
+              Bundle.main.bundleURL.pathExtension == "app",
+              !key.isEmpty, !key.contains("REPLACE_WITH"),
+              build != "1"
+        else { return nil }
+        return SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    }
 
     init() {
         let appState: AppState
@@ -69,6 +85,24 @@ struct MacMessApp: App {
                 .environment(state)
                 .environment(flow)
         }
+        .commands {
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesButton(updater: updaterController?.updater)
+            }
+        }
+    }
+}
+
+/// Menu "Kiểm tra cập nhật…": disabled khi không có updater hoặc updater chưa sẵn sàng.
+struct CheckForUpdatesButton: View {
+    let updater: SPUUpdater?
+    @State private var canCheck = false
+
+    var body: some View {
+        Button("Kiểm tra cập nhật…") { updater?.checkForUpdates() }
+            .disabled(updater == nil || !canCheck)
+            .onReceive(updater?.publisher(for: \.canCheckForUpdates).eraseToAnyPublisher()
+                       ?? Empty<Bool, Never>().eraseToAnyPublisher()) { canCheck = $0 }
     }
 }
 
