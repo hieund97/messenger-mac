@@ -46,11 +46,23 @@ struct SidebarView: View {
                         }
                         .buttonStyle(.plain)
                     }
+                    if state.isLoadingConversations { ProgressView().controlSize(.small).padding(8) }
+                    if state.conversationsError != nil {
+                        Button("Không tải được — Thử lại") { state.loadMoreConversations(retry: true) }
+                            .padding(8)
+                    } else if state.hasMoreConversations {
+                        Color.clear.frame(height: 1)
+                            .task(id: "\(state.conversations.count)-\(state.isLoadingConversations)-\(state.connection.state)") {
+                                if !state.isLoadingConversations, state.connection.state == "connected" {
+                                    state.loadMoreConversations()
+                                }
+                            }
+                    }
                 }
                 .padding(.horizontal, 6)
             }
             .overlay {
-                if filtered.isEmpty {
+                if filtered.isEmpty, state.conversationsError == nil {
                     ContentUnavailableView(query.isEmpty ? "Chưa có cuộc trò chuyện" : "Không tìm thấy",
                                            systemImage: query.isEmpty ? "tray" : "magnifyingglass")
                 }

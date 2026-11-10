@@ -76,11 +76,24 @@ type MetaBackend struct {
 	refreshes   mediaRefreshes
 	// onE2EESent, when set, is called after each successful E2EE send (see E2EESentHook).
 	onE2EESent E2EESentHook
+	// History (history.go, securehistory.go). history is reset per login; the overrides are for tests.
+	history         *historyState
+	historyOverride historyOps
+	pagerOverride   threadPager
+	pagingDelay     time.Duration // 0 means defaultPagingDelay
+	pagingMu        sync.Mutex
+	lastPage        map[string]time.Time // spacing of history batches and thread list pages
+	fetching        map[string]bool      // conversations with a fetch_messages running
+	threadPaging    sync.Mutex           // one thread list page request at a time
 }
 
 var e2eeFullReconnectBackoff = []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 10 * time.Minute}
 
-func NewMetaBackend(cfg Config) *MetaBackend { return &MetaBackend{cfg: cfg} }
+func NewMetaBackend(cfg Config) *MetaBackend {
+	b := &MetaBackend{cfg: cfg, history: &historyState{}}
+	b.onE2EESent = b.queueHistoryUpload
+	return b
+}
 func (b *MetaBackend) Login(ctx context.Context, args LoginArgs, emit func(Event)) error {
 	b.op.Lock()
 	defer b.op.Unlock()
@@ -132,6 +145,10 @@ func (b *MetaBackend) Login(ctx context.Context, args LoginArgs, emit func(Event
 	b.auth = false
 	b.lastFatalReconnect = time.Time{}
 	b.index = NewThreadIndex(c.GetUserID())
+	// With the device saved from an earlier restore, E2EE history is readable without the PIN.
+	device := deviceFromSecrets(args.Secrets, c.GetUserID())
+	b.history.reset(device)
+	b.index.SetHistoryRestored(device != nil, nil)
 	b.e2eeFullReconnects, b.lastE2EEReconnect, b.icdcFailures = 0, time.Time{}, 0
 	b.mu.Unlock()
 	return b.startSession(ctx, c, p)
@@ -355,6 +372,7 @@ func (b *MetaBackend) watchCookies(ctx context.Context, client metaClient) {
 	}
 }
 func (b *MetaBackend) stop() {
+	b.history.reset(nil)
 	b.mu.Lock()
 	c, cancel, file, e2ee := b.client, b.cancel, b.logFile, b.e2ee
 	b.client = nil
@@ -441,16 +459,6 @@ func (b *MetaBackend) reconnect(ctx context.Context, expected metaClient) error 
 		_ = file.Close()
 	}
 	return b.startSession(ctx, c, c.Platform)
-}
-func notImplemented() error { return &Error{Code: "not_implemented", Message: "not implemented"} }
-func (*MetaBackend) RestoreHistory(context.Context, RestoreHistoryArgs, func(Event)) error {
-	return notImplemented()
-}
-func (*MetaBackend) SkipHistoryRestore(context.Context, SkipHistoryRestoreArgs, func(Event)) error {
-	return notImplemented()
-}
-func (*MetaBackend) FetchMessages(context.Context, FetchMessagesArgs, func(Event)) error {
-	return notImplemented()
 }
 
 var (

@@ -75,6 +75,12 @@ func main() {
 				event.Data = message
 			}
 		}
+		if *redact && event.Type == engine.EventSecretStore {
+			if secret, ok := event.Data.(engine.SecretStore); ok {
+				secret.Value = "[redacted]"
+				event.Data = secret
+			}
+		}
 		if event.Type == engine.EventCookiesUpdated {
 			if update, ok := event.Data.(engine.CookiesUpdated); ok {
 				for i := range update.Cookies {

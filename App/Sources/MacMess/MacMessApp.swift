@@ -130,7 +130,9 @@ struct RootView: View {
             flow.step = outcome == .resumed ? .main : .picker
         }
         .onChange(of: state.historyRestore.state) { _, new in
-            if new == "needed", flow.step == .main, !flow.pinDismissed { flow.showPIN = true }
+            if new == "needed", flow.step == .main, !flow.pinDismissed {
+                flow.showPIN = true
+            }
             if new == "done" { flow.showPIN = false }
         }
         // Mất phiên (đăng xuất, đăng nhập thất bại) → về chọn trình duyệt; auth_required thì giữ màn chính + AuthBanner.
@@ -190,7 +192,9 @@ struct MainView: View {
             PINEntryView(onSkip: { flow.pinDismissed = true; flow.showPIN = false })
         }
         .onAppear {
-            if state.historyRestore.state == "needed", !flow.pinDismissed { flow.showPIN = true }
+            if state.historyRestore.state == "needed", !flow.pinDismissed {
+                flow.showPIN = true
+            }
         }
     }
 }

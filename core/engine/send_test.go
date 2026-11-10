@@ -15,6 +15,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waConsumerApplication"
+	"go.mau.fi/whatsmeow/proto/waMsgApplication"
 	waTypes "go.mau.fi/whatsmeow/types"
 )
 
@@ -124,7 +125,10 @@ func (f *fakeWA) Upload(context.Context, []byte, whatsmeow.MediaType) (whatsmeow
 	f.uploads++
 	return whatsmeow.UploadResponse{DirectPath: "/v/t62/x", MediaKey: make([]byte, 32), FileSHA256: make([]byte, 32), FileEncSHA256: make([]byte, 32)}, nil
 }
-func (f *fakeWA) SendFBMessage(ctx context.Context, _ waTypes.JID, msg *waConsumerApplication.ConsumerApplication, id string) (whatsmeow.SendResponse, error) {
+func (f *fakeWA) SendFBMessage(ctx context.Context, _ waTypes.JID, msg *waConsumerApplication.ConsumerApplication, meta *waMsgApplication.MessageApplication_Metadata, id string) (whatsmeow.SendResponse, error) {
+	if meta != nil {
+		meta.FrankingKey = make([]byte, 32) // whatsmeow sets a random franking key
+	}
 	f.mu.Lock()
 	f.sends = append(f.sends, id)
 	f.sent = append(f.sent, msg)
@@ -799,7 +803,7 @@ func TestE2EESentHookCalledOnSuccessOnly(t *testing.T) {
 		id   string
 	}
 	calls := make(chan call, 4)
-	b.onE2EESent = func(_ context.Context, chat waTypes.JID, id string, msg *waConsumerApplication.ConsumerApplication, _ time.Time) {
+	b.onE2EESent = func(_ context.Context, chat waTypes.JID, id string, msg *waConsumerApplication.ConsumerApplication, _ *waMsgApplication.MessageApplication_Metadata, _ time.Time) {
 		if msg == nil {
 			t.Error("hook without message")
 		}

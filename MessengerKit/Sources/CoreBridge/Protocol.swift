@@ -113,13 +113,40 @@ public struct ConnectionState: Codable, Sendable, Equatable {
 public struct HistoryRestoreState: Codable, Sendable, Equatable {
     public var state: String
     public var reason: String?
+    public var attemptsRemaining: Int?
 
-    public init(state: String, reason: String? = nil) {
+    public init(state: String, reason: String? = nil, attemptsRemaining: Int? = nil) {
         self.state = state
         self.reason = reason
+        self.attemptsRemaining = attemptsRemaining
     }
 
-    enum CodingKeys: String, CodingKey { case state, reason }
+    public var failureMessage: String {
+        switch reason {
+        case "wrong_pin":
+            if let attemptsRemaining { return "Mã PIN không đúng, còn \(attemptsRemaining) lần thử" }
+            return "Mã PIN không đúng"
+        case "no_backup": return "Tài khoản chưa có bản sao lưu lịch sử chat"
+        case "locked": return "Đã hết lượt nhập PIN. Hãy đặt lại PIN trong app Messenger trên điện thoại."
+        case "auth_required": return "Phiên đăng nhập đã hết hạn, hãy đăng nhập lại."
+        default: return "Không khôi phục được, thử lại sau"
+        }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case state, reason
+        case attemptsRemaining = "attempts_remaining"
+    }
+}
+
+public struct SecretStore: Codable, Sendable, Equatable {
+    public var key: String
+    public var value: String
+
+    public init(key: String, value: String) {
+        self.key = key
+        self.value = value
+    }
 }
 
 public struct MessageSendResult: Codable, Sendable, Equatable {
@@ -296,13 +323,13 @@ struct CookiesUpdatedPayload: Decodable {
 
 /// Lệnh gửi sang core. Tên cmd và field args khớp `core/engine/protocol.go`.
 public enum CoreCommand: Sendable, Equatable {
-    case login(cookies: [CookieParam], platform: String)
+    case login(cookies: [CookieParam], platform: String, secrets: [String: String]? = nil)
     case restoreHistory(pin: String)
     case skipHistoryRestore
     case logout
     case reconnect
-    case listConversations(cursor: String?)
-    case fetchMessages(conversationID: String, beforeTS: Int64?, limit: Int)
+    case fetchConversations(cursor: String?)
+    case fetchMessages(conversationID: String, cursor: String? = nil, limit: Int = 20)
     case sendText(conversationID: String, text: String, clientID: String)
     case sendMedia(conversationID: String, filePath: String, mime: String, clientID: String)
     case markRead(conversationID: String, untilTS: Int64)
@@ -315,7 +342,7 @@ public enum CoreCommand: Sendable, Equatable {
         case .skipHistoryRestore: "skip_history_restore"
         case .logout: "logout"
         case .reconnect: "reconnect"
-        case .listConversations: "list_conversations"
+        case .fetchConversations: "fetch_conversations"
         case .fetchMessages: "fetch_messages"
         case .sendText: "send_text"
         case .sendMedia: "send_media"
@@ -326,8 +353,8 @@ public enum CoreCommand: Sendable, Equatable {
 
     var args: [String: JSONValue] {
         switch self {
-        case .login(let cookies, let platform):
-            return [
+        case .login(let cookies, let platform, let secrets):
+            var args: [String: JSONValue] = [
                 "cookies": .array(cookies.map { c in
                     var o: [String: JSONValue] = ["name": .string(c.name), "value": .string(c.value), "domain": .string(c.domain)]
                     if let e = c.expires { o["expires"] = .int(e) }
@@ -335,15 +362,17 @@ public enum CoreCommand: Sendable, Equatable {
                 }),
                 "platform": .string(platform),
             ]
+            if let secrets { args["secrets"] = .object(secrets.mapValues { .string($0) }) }
+            return args
         case .restoreHistory(let pin):
             return ["pin": .string(pin)]
         case .skipHistoryRestore, .logout, .reconnect:
             return [:]
-        case .listConversations(let cursor):
+        case .fetchConversations(let cursor):
             return cursor.map { ["cursor": .string($0)] } ?? [:]
-        case .fetchMessages(let id, let before, let limit):
+        case .fetchMessages(let id, let cursor, let limit):
             var o: [String: JSONValue] = ["conversation_id": .string(id), "limit": .int(Int64(limit))]
-            if let before { o["before_ts"] = .int(before) }
+            if let cursor { o["cursor"] = .string(cursor) }
             return o
         case .sendText(let id, let text, let clientID):
             return ["conversation_id": .string(id), "text": .string(text), "client_id": .string(clientID)]
@@ -367,6 +396,7 @@ public enum CoreEvent: Decodable, Sendable, Equatable {
     case messageSendResult(MessageSendResult)
     case readReceipt(ReadReceipt)
     case cookiesUpdated([CookieParam])
+    case secretStore(SecretStore)
     case error(CoreError)
     case unknown(String)
 
@@ -383,10 +413,10 @@ public enum CoreEvent: Decodable, Sendable, Equatable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let type = try c.decode(String.self, forKey: .type)
-        // Chỉ log type + lỗi, không log nội dung (có thể chứa cookie/tin nhắn).
+        // Chỉ log type; mô tả lỗi decode có thể chứa giá trị bí mật.
         func payload<T: Decodable>(_ t: T.Type) -> T? {
             do { return try c.decode(T.self, forKey: .data) } catch {
-                bridgeLogger.error("decode failed type=\(type, privacy: .public) error=\(String(describing: error), privacy: .public)")
+                bridgeLogger.error("decode failed type=\(type, privacy: .public)")
                 return nil
             }
         }
@@ -412,6 +442,8 @@ public enum CoreEvent: Decodable, Sendable, Equatable {
             self = payload(MessageSendResult.self).map(CoreEvent.messageSendResult) ?? .unknown(type)
         case "read_receipt":
             self = payload(ReadReceipt.self).map(CoreEvent.readReceipt) ?? .unknown(type)
+        case "secret_store":
+            self = payload(SecretStore.self).map(CoreEvent.secretStore) ?? .unknown(type)
         case "cookies_updated":
             self = payload(CookiesUpdatedPayload.self).map { CoreEvent.cookiesUpdated($0.cookies) } ?? .unknown(type)
         case "error":

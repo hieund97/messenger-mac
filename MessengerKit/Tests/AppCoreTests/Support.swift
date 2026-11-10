@@ -7,6 +7,13 @@ import LocalStore
 final class MemoryKeychain: KeychainStoring, @unchecked Sendable {
     // @unchecked: bản giả cho test, mọi truy cập qua lock.
     private let lock = NSLock()
+    private var failSecretReads = false
+
+    func rejectSecretReads() {
+        lock.lock(); defer { lock.unlock() }
+        failSecretReads = true
+    }
+
     private var items: [String: Data] = [:]
 
     func set(_ data: Data, service: String, account: String) throws {
@@ -15,6 +22,7 @@ final class MemoryKeychain: KeychainStoring, @unchecked Sendable {
     }
     func get(service: String, account: String) throws -> Data? {
         lock.lock(); defer { lock.unlock() }
+        if failSecretReads, account.hasSuffix("/secure_history_device") { throw SessionStoreError.keychain(-1) }
         return items["\(service)|\(account)"]
     }
     func delete(service: String, account: String) throws {
@@ -33,12 +41,14 @@ actor MockLink: CoreLink {
         (events, continuation) = AsyncStream<CoreEvent>.makeStream()
     }
 
-    nonisolated func call(_ cmd: CoreCommand) async throws -> CoreResponse {
-        await record(cmd)
-        return CoreResponse(ok: true)
-    }
+    private var responses: [CoreResponse] = []
 
-    private func record(_ cmd: CoreCommand) { commands.append(cmd) }
+    func enqueue(_ response: CoreResponse) { responses.append(response) }
+
+    func call(_ cmd: CoreCommand) async throws -> CoreResponse {
+        commands.append(cmd)
+        return responses.isEmpty ? CoreResponse(ok: true) : responses.removeFirst()
+    }
 
     nonisolated func shutdown() async { continuation.finish() }
 
@@ -67,6 +77,7 @@ func loggedInState(keychain: MemoryKeychain = MemoryKeychain()) async throws -> 
                          dataDir: FileManager.default.temporaryDirectory.appendingPathComponent("macmess-test"),
                          bridgeFactory: { _ in link })
     await state.login(cookies: sessionCookies)
+    await state.apply(.connectionState(ConnectionState(state: "connected")))
     return (state, link, keychain)
 }
 
@@ -122,3 +133,8 @@ func safeDownloadResult(_ filename: String?, existing: [String] = []) -> (name: 
 }
 
 func nowMillis() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+
+let otherAccountCookies = [
+    Cookie(name: "c_user", value: "200", domain: ".messenger.com"),
+    Cookie(name: "xs", value: "test-new-account", domain: ".messenger.com"),
+]

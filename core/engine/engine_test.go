@@ -67,7 +67,8 @@ func TestFakeLoginEmitsConnectedThenConversations(t *testing.T) {
 	e := New(Config{Backend: "fake"}, func(ev Event) { events <- ev })
 	defer e.Shutdown()
 	_, got := collect(t, e, events, `{"cmd":"login","args":{"cookies":[],"platform":"messenger"}}`)
-	if len(got) != 7 || got[0].Type != EventConnectionState || responseData(t, got[0])["state"] != "connected" || got[1].Type != EventConversationUpsert || got[2].Type != EventConversationUpsert {
+	if len(got) != 8 || got[0].Type != EventConnectionState || responseData(t, got[0])["state"] != "connected" || got[1].Type != EventConversationUpsert || got[2].Type != EventConversationUpsert ||
+		got[6].Type != EventHistoryRestoreState || responseData(t, got[6])["state"] != "needed" {
 		t.Fatalf("events: %#v", got)
 	}
 }
@@ -249,5 +250,48 @@ func TestConcurrentCallsEachGetOneResponse(t *testing.T) {
 		if id <= 0 || responses[id] != 1 {
 			t.Fatalf("request %d received %d responses", id, responses[id])
 		}
+	}
+}
+
+func TestFakeTimestampsAreRecent(t *testing.T) {
+	var messages int
+	before := time.Now().Add(-time.Hour).UnixMilli()
+	_ = (FakeBackend{}).Login(context.Background(), LoginArgs{}, func(event Event) {
+		if event.Type == EventMessageUpsert {
+			messages++
+			if msg := event.Data.(Message); msg.TS < before || msg.TS > time.Now().UnixMilli() {
+				t.Errorf("fake timestamp is not recent: %d", msg.TS)
+			}
+		}
+	})
+	if messages == 0 {
+		t.Fatal("no fake messages")
+	}
+}
+
+func TestFakeFetchPagingAndRestore(t *testing.T) {
+	events := make(chan Event, 200)
+	e := New(Config{Backend: "fake"}, func(ev Event) { events <- ev })
+	defer e.Shutdown()
+	_, got := collect(t, e, events, `{"cmd":"fetch_messages","args":{"conversation_id":"u:1","limit":50}}`)
+	data := responseData(t, got[len(got)-1])["data"].(map[string]any)
+	if len(got) != 51 || data["has_more"] != true {
+		t.Fatalf("first page: %d events, %v", len(got), data)
+	}
+	_, got = collect(t, e, events, fmt.Sprintf(`{"cmd":"fetch_messages","args":{"conversation_id":"u:1","limit":50,"cursor":%q}}`, data["cursor"]))
+	if data = responseData(t, got[len(got)-1])["data"].(map[string]any); len(got) != 11 || data["has_more"] != false {
+		t.Fatalf("last page: %d events, %v", len(got), data)
+	}
+	_, got = collect(t, e, events, `{"cmd":"fetch_messages","args":{"conversation_id":"u:2"}}`)
+	if data = responseData(t, got[len(got)-1])["data"].(map[string]any); data["needs_restore"] != true || data["has_more"] != false {
+		t.Fatalf("E2EE before restore: %v", data)
+	}
+	_, got = collect(t, e, events, `{"cmd":"restore_history","args":{"pin":"123456"}}`)
+	if last := got[len(got)-2]; last.Type != EventHistoryRestoreState || responseData(t, last)["state"] != "done" {
+		t.Fatalf("restore: %#v", got)
+	}
+	_, got = collect(t, e, events, `{"cmd":"fetch_conversations","args":{}}`)
+	if data = responseData(t, got[len(got)-1])["data"].(map[string]any); len(got) != 11 || data["has_more"] != true {
+		t.Fatalf("conversations: %d events, %v", len(got), data)
 	}
 }

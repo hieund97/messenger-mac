@@ -32,6 +32,7 @@ extension CoreSerialTests {
             let collector = Task { () -> [CoreEvent] in
                 var got: [CoreEvent] = []
                 for await e in bridge.events {
+                    if case .historyRestoreState = e { continue }
                     got.append(e)
                     if got.count == 3 { break }
                 }
@@ -72,6 +73,35 @@ extension CoreSerialTests {
     }
 
     // Không có testShutdownResumesPendingCalls: FakeBackend trả ngay mọi lệnh, không có lệnh treo để giữ pending.
+
+    @Test func testSecretStoreAndRestoreFailureDecode() throws {
+        let secret = try CoreEvent.parse(#"{"type":"secret_store","data":{"key":"secure_history_device","value":"device-value"}}"#)
+        #expect(secret == .secretStore(SecretStore(key: "secure_history_device", value: "device-value")))
+        let failed = try CoreEvent.parse(#"{"type":"history_restore_state","data":{"state":"failed","reason":"wrong_pin","attempts_remaining":4}}"#)
+        #expect(failed == .historyRestoreState(HistoryRestoreState(state: "failed", reason: "wrong_pin", attemptsRemaining: 4)))
+        let done = try CoreEvent.parse(#"{"type":"history_restore_state","data":{"state":"done"}}"#)
+        #expect(done == .historyRestoreState(HistoryRestoreState(state: "done")))
+    }
+
+    @Test func testLockedAndAuthRequiredDecodeAndMessages() throws {
+        let locked = try CoreEvent.parse(#"{"type":"history_restore_state","data":{"state":"failed","reason":"locked","attempts_remaining":0}}"#)
+        guard case .historyRestoreState(let state) = locked else { Issue.record("missing restore state"); return }
+        #expect(state.attemptsRemaining == 0)
+        #expect(state.failureMessage == "Đã hết lượt nhập PIN. Hãy đặt lại PIN trong app Messenger trên điện thoại.")
+        let auth = try CoreEvent.parse(#"{"type":"history_restore_state","data":{"state":"failed","reason":"auth_required"}}"#)
+        guard case .historyRestoreState(let expired) = auth else { Issue.record("missing restore state"); return }
+        #expect(expired.failureMessage == "Phiên đăng nhập đã hết hạn, hãy đăng nhập lại.")
+    }
+
+    @Test func testPaginationAndLoginArguments() {
+        let page = CoreCommand.fetchMessages(conversationID: "u:2", cursor: "opaque/+==", limit: 20)
+        #expect(page.args["cursor"] == .string("opaque/+=="))
+        #expect(page.args["before_ts"] == nil)
+        #expect(CoreCommand.fetchConversations(cursor: nil).name == "fetch_conversations")
+        #expect(CoreCommand.login(cookies: [], platform: "messenger", secrets: ["secure_history_device": "value"]).args["secrets"]
+                == .object(["secure_history_device": .string("value")]))
+        #expect(CoreCommand.login(cookies: [], platform: "messenger").args["secrets"] == nil)
+    }
 
     @Test func testMessageUpsertWithNullAttachmentsDecodes() throws {
         let json = #"{"type":"message_upsert","request_id":7,"data":{"id":"1","conversation_id":"u:1","thread_id":"u:1","e2ee":false,"sender_id":"1","is_outgoing":false,"ts":1,"text":"Hi","attachments":null}}"#

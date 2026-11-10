@@ -61,7 +61,9 @@ struct ChatView: View {
     let conversation: Conversation
     @State private var opened = false
     @State private var dropTargeted = false
+    @State private var contentFrame: CGRect = .zero
     @State private var viewportHeight: CGFloat = 600
+    @State private var olderAnchor: String?
     @State private var nearBottom = true
     @State private var atTop = false
     @State private var scrolledAway = false
@@ -74,15 +76,6 @@ struct ChatView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            if !conversation.historyRestored, ["needed", "failed"].contains(state.historyRestore.state) {
-                HStack {
-                    Image(systemName: "lock.fill")
-                    Text("Chưa khôi phục lịch sử")
-                    Spacer()
-                    Button("Nhập PIN") { flow.pinDismissed = false; flow.showPIN = true }
-                }
-                .font(.callout).padding(8).background(Color.yellow.opacity(0.18))
-            }
             messageList
             ComposerView(onSend: { state.send(text: $0, to: conversation.id) }, onFiles: sendFiles)
         }
@@ -96,8 +89,12 @@ struct ChatView: View {
         .task {
             await state.open(conversationID: conversation.id)
             opened = true
+            if messages.isEmpty || (contentFrame.height > 0 && contentFrame.height <= viewportHeight) {
+                requestOlder()
+            }
             markReadIfNeeded()
         }
+        .onDisappear { state.close(conversationID: conversation.id) }
         .onChange(of: activeState) { _, _ in markReadIfNeeded() }
         .onChange(of: messages.last?.ts) { _, _ in markReadIfNeeded() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in markReadIfNeeded() }
@@ -118,6 +115,20 @@ struct ChatView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(spacing: 0) {
+                        if state.needsPINForOlder(conversationID: conversation.id) {
+                            VStack(spacing: 6) {
+                                Text("Tin nhắn mã hóa cũ hơn cần PIN để xem")
+                                    .font(.callout).foregroundStyle(.secondary)
+                                Button("Nhập PIN") { flow.showPIN = true }
+                            }
+                            .padding(10)
+                        }
+                        if state.olderError[conversation.id] != nil || state.olderPaused.contains(conversation.id) {
+                            Button(state.olderError[conversation.id] == nil ? "Thử lại" : "Không tải được tin nhắn cũ — Thử lại") {
+                                requestOlder(retry: true)
+                            }
+                            .padding(8)
+                        }
                         ForEach(rows) { row in
                             switch row {
                             case .time(_, let label):
@@ -135,15 +146,38 @@ struct ChatView: View {
                         Color.clear.preference(key: ContentFrameKey.self, value: g.frame(in: .named("chatViewport")))
                     })
                 }
+                .overlay(alignment: .top) {
+                    if state.loadingOlder.contains(conversation.id) {
+                        ProgressView().controlSize(.small).padding(8)
+                    }
+                }
                 .coordinateSpace(name: "chatViewport")
                 .defaultScrollAnchor(.bottom)
                 .onPreferenceChange(ContentFrameKey.self) { frame in
+                    contentFrame = frame
+                    viewportHeight = outer.size.height
                     handleScroll(frame, viewport: outer.size.height)
                 }
                 .onChange(of: lastKey) { old, new in
                     // Chỉ cuộn khi đang ở gần đáy hoặc tin của mình; id optimistic → id thật giữ nguyên key nên không cuộn.
-                    guard let new, old != nil, let last = messages.last else { return }
+                    guard let new, let last = messages.last else { return }
+                    if old == nil { proxy.scrollTo("m-" + new, anchor: .bottom); return }
+                    guard !state.loadingOlder.contains(conversation.id), olderAnchor == nil else { return }
                     if last.isOutgoing || nearBottom { withAnimation { proxy.scrollTo("m-" + new, anchor: .bottom) } }
+                }
+                .onChange(of: state.loadingOlder.contains(conversation.id)) { _, loading in
+                    if loading {
+                        if olderAnchor == nil { olderAnchor = messages.first.map { "m-" + ($0.clientID ?? $0.id) } }
+                    } else {
+                        if let olderAnchor { proxy.scrollTo(olderAnchor, anchor: .top) }
+                        olderAnchor = nil
+                    }
+                }
+                .task(id: "\(opened)-\(state.loadingOlder.contains(conversation.id))-\(messages.count)-\(contentFrame.height)-\(outer.size.height)") {
+                    if opened, contentFrame.height > 0, contentFrame.height <= outer.size.height,
+                       !state.olderPaused.contains(conversation.id) {
+                        requestOlder()
+                    }
                 }
                 .task(id: opened) {
                     if opened, let k = lastKey { proxy.scrollTo("m-" + k, anchor: .bottom) }
@@ -159,9 +193,19 @@ struct ChatView: View {
         let top = frame.minY > -30
         if top != atTop {
             atTop = top
-            // Chỉ nạp thêm khi người dùng thật sự cuộn lên tới đầu (nội dung ngắn thì không cuộn được nên không gọi).
-            if top, scrolledAway, opened { state.loadOlder(conversationID: conversation.id) }
+            // Sau lỗi/trang rỗng chỉ thử lại khi đã cuộn xuống rồi lên lại.
+            if top, scrolledAway, opened {
+                scrolledAway = false
+                requestOlder(retry: true)
+            }
         }
+    }
+
+    private func requestOlder(retry: Bool = false) {
+        guard !state.loadingOlder.contains(conversation.id) else { return }
+        let anchor = messages.first.map { "m-" + ($0.clientID ?? $0.id) }
+        state.loadOlder(conversationID: conversation.id, retry: retry)
+        if state.loadingOlder.contains(conversation.id) { olderAnchor = anchor }
     }
 
     private func sendFiles(_ urls: [URL]) {

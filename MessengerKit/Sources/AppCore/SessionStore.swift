@@ -53,6 +53,7 @@ public struct SystemKeychainStore: KeychainStoring {
 /// Bí mật của phiên (cookie, `secret_store`) trong Keychain: service `dev.hieund.macmess`, account `<c_user>/<key>`.
 public struct SessionStore: Sendable {
     public static let service = "dev.hieund.macmess"
+    public static let historySecretKey = "secure_history_device"
     static let cookiesKey = "cookies"
     private let keychain: any KeychainStoring
     private let service: String
@@ -79,7 +80,12 @@ public struct SessionStore: Sendable {
     }
 
     public func saveSecret(_ value: String, key: String, cUser: String) throws {
+        guard !value.isEmpty else { try deleteSecret(key: key, cUser: cUser); return }
         try keychain.set(Data(value.utf8), service: service, account: account(cUser, key))
+    }
+
+    public func deleteSecret(key: String, cUser: String) throws {
+        try keychain.delete(service: service, account: account(cUser, key))
     }
 
     public func loadSecret(key: String, cUser: String) throws -> String? {

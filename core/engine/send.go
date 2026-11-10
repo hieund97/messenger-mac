@@ -90,7 +90,8 @@ type lsOps interface {
 type waOps interface {
 	WaitReady(ctx context.Context) error
 	Upload(ctx context.Context, data []byte, mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
-	SendFBMessage(ctx context.Context, to waTypes.JID, msg *waConsumerApplication.ConsumerApplication, id string) (whatsmeow.SendResponse, error)
+	// SendFBMessage fills meta (franking key) as whatsmeow does; the history upload needs it.
+	SendFBMessage(ctx context.Context, to waTypes.JID, msg *waConsumerApplication.ConsumerApplication, meta *waMsgApplication.MessageApplication_Metadata, id string) (whatsmeow.SendResponse, error)
 	MarkRead(ctx context.Context, ids []string, ts time.Time, chat, sender waTypes.JID) error
 	DownloadToFile(ctx context.Context, ref mediaRef, mediaType whatsmeow.MediaType, file whatsmeow.File) error
 }
@@ -139,12 +140,12 @@ func (r realWA) Upload(ctx context.Context, data []byte, mediaType whatsmeow.Med
 	}
 	return c.Upload(ctx, data, mediaType)
 }
-func (r realWA) SendFBMessage(ctx context.Context, to waTypes.JID, msg *waConsumerApplication.ConsumerApplication, id string) (whatsmeow.SendResponse, error) {
+func (r realWA) SendFBMessage(ctx context.Context, to waTypes.JID, msg *waConsumerApplication.ConsumerApplication, meta *waMsgApplication.MessageApplication_Metadata, id string) (whatsmeow.SendResponse, error) {
 	c, err := r.cli()
 	if err != nil {
 		return whatsmeow.SendResponse{}, err
 	}
-	return c.SendFBMessage(ctx, to, msg, &waMsgApplication.MessageApplication_Metadata{}, whatsmeow.SendRequestExtra{ID: id})
+	return c.SendFBMessage(ctx, to, msg, meta, whatsmeow.SendRequestExtra{ID: id})
 }
 func (r realWA) MarkRead(ctx context.Context, ids []string, ts time.Time, chat, sender waTypes.JID) error {
 	c, err := r.cli()
@@ -518,10 +519,11 @@ func sendOutcomeFrom(tbl *table.LSTable, otid string, response bool) (sendOutcom
 	return sendOutcome{}, false
 }
 
-// E2EESentHook is called after an E2EE message was sent successfully, with the message as sent. It
-// runs on the conversation's send queue after message_send_result was emitted, so a slow hook must
-// start its own goroutine. Task 6 uses it to add sent messages to the secure history backup.
-type E2EESentHook func(ctx context.Context, chat waTypes.JID, messageID string, msg *waConsumerApplication.ConsumerApplication, ts time.Time)
+// E2EESentHook is called after an E2EE message was sent successfully, with the message and the
+// application metadata (franking key) as sent. It runs on the conversation's send queue after
+// message_send_result was emitted, so a slow hook must start its own goroutine. NewMetaBackend sets it
+// to queueHistoryUpload, which adds sent messages to the secure history backup.
+type E2EESentHook func(ctx context.Context, chat waTypes.JID, messageID string, msg *waConsumerApplication.ConsumerApplication, meta *waMsgApplication.MessageApplication_Metadata, ts time.Time)
 
 // deliverWA sends the E2EE message once with the ID derived from client_id and reports the outcome.
 // The sending device gets no echo from the server, so a successful send is echoed locally through the
@@ -531,7 +533,7 @@ func (b *MetaBackend) deliverWA(s liveSession, chat waTypes.JID, clientID string
 	defer rep.recover()
 	id := waMessageID(clientID)
 	s.index.RememberClientID("", id, clientID)
-	o, msg, ts := b.writeWA(s, chat, id, build, &rep.written)
+	o, msg, meta, ts := b.writeWA(s, chat, id, build, &rep.written)
 	rep.outcome = &o
 	if o.status == "sent" && emit != nil {
 		evt := &events.FBMessage{Message: msg}
@@ -544,44 +546,45 @@ func (b *MetaBackend) deliverWA(s liveSession, chat waTypes.JID, clientID string
 	}
 	rep.send(o)
 	if o.status == "sent" && b.onE2EESent != nil {
-		b.onE2EESent(s.ctx, chat, id, msg, ts)
+		b.onE2EESent(s.ctx, chat, id, msg, meta, ts)
 	}
 }
 
-func (b *MetaBackend) writeWA(s liveSession, chat waTypes.JID, id string, build func(context.Context) (*waConsumerApplication.ConsumerApplication, error), written *atomic.Bool) (sendOutcome, *waConsumerApplication.ConsumerApplication, time.Time) {
+func (b *MetaBackend) writeWA(s liveSession, chat waTypes.JID, id string, build func(context.Context) (*waConsumerApplication.ConsumerApplication, error), written *atomic.Bool) (sendOutcome, *waConsumerApplication.ConsumerApplication, *waMsgApplication.MessageApplication_Metadata, time.Time) {
 	readyCtx, cancel := context.WithTimeout(s.ctx, sendReadyTimeout)
 	err := s.wa.WaitReady(readyCtx)
 	cancel()
 	if err != nil {
-		return sendOutcome{status: "failed", code: "disconnected"}, nil, time.Time{}
+		return sendOutcome{status: "failed", code: "disconnected"}, nil, nil, time.Time{}
 	}
 	prepCtx, cancel := context.WithTimeout(s.ctx, uploadTimeout)
 	msg, err := build(prepCtx)
 	cancel()
 	if err != nil {
-		return sendOutcome{status: "failed", code: "upload_failed"}, nil, time.Time{}
+		return sendOutcome{status: "failed", code: "upload_failed"}, nil, nil, time.Time{}
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, b.confirmTimeout())
 	defer cancel()
 	written.Store(true)
-	resp, err := s.wa.SendFBMessage(ctx, chat, msg, id)
+	meta := &waMsgApplication.MessageApplication_Metadata{}
+	resp, err := s.wa.SendFBMessage(ctx, chat, msg, meta, id)
 	switch {
 	case err == nil:
 		ts := resp.Timestamp
 		if ts.IsZero() {
 			ts = time.Now()
 		}
-		return sendOutcome{status: "sent", messageID: id}, msg, ts
+		return sendOutcome{status: "sent", messageID: id}, msg, meta, ts
 	case errors.Is(err, whatsmeow.ErrServerReturnedError):
-		return sendOutcome{status: "failed", code: "rejected"}, nil, time.Time{}
+		return sendOutcome{status: "failed", code: "rejected"}, nil, nil, time.Time{}
 	case errors.Is(err, whatsmeow.ErrNotLoggedIn), errors.Is(err, whatsmeow.ErrClientIsNil):
-		return sendOutcome{status: "failed", code: "disconnected"}, nil, time.Time{} // refused before writing
+		return sendOutcome{status: "failed", code: "disconnected"}, nil, nil, time.Time{} // refused before writing
 	case errors.Is(err, whatsmeow.ErrRecipientADJID), errors.Is(err, whatsmeow.ErrUnknownServer):
-		return outcomeInternal, nil, time.Time{} // invalid chat JID, refused before writing
+		return outcomeInternal, nil, nil, time.Time{} // invalid chat JID, refused before writing
 	default:
 		// Timed out or the socket dropped after the message may have been written. This includes
 		// ErrNotConnected: request.go retryFrame returns it after the node was already sent.
-		return outcomeNotConfirmed, nil, time.Time{}
+		return outcomeNotConfirmed, nil, nil, time.Time{}
 	}
 }
 

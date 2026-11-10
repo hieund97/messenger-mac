@@ -10,6 +10,7 @@ const (
 	CmdReconnect             = "reconnect"
 	CmdListConversations     = "list_conversations"
 	CmdFetchMessages         = "fetch_messages"
+	CmdFetchConversations    = "fetch_conversations"
 	CmdSendText              = "send_text"
 	CmdSendMedia             = "send_media"
 	CmdMarkRead              = "mark_read"
@@ -18,6 +19,7 @@ const (
 	EventResponse            = "response"
 	EventConnectionState     = "connection_state"
 	EventHistoryRestoreState = "history_restore_state"
+	EventSecretStore         = "secret_store"
 	EventConversationUpsert  = "conversation_upsert"
 	EventMessageUpsert       = "message_upsert"
 	EventMessageSendResult   = "message_send_result"
@@ -51,10 +53,26 @@ type ConnectionState struct {
 	State  string  `json:"state"`
 	Reason *string `json:"reason,omitempty"`
 }
+
+// HistoryRestoreState.State is needed | in_progress | done | failed | skipped. Reason (failed only) is
+// wrong_pin | no_backup | other; AttemptsRemaining comes with wrong_pin when the server reports it.
 type HistoryRestoreState struct {
-	State  string  `json:"state"`
-	Reason *string `json:"reason,omitempty"`
+	State             string  `json:"state"`
+	Reason            *string `json:"reason,omitempty"`
+	AttemptsRemaining *int    `json:"attempts_remaining,omitempty"`
 }
+
+// SecretStore asks Swift to keep Value under Key (Keychain) and pass it back in LoginArgs.Secrets.
+// A later secret_store with the same key replaces the value.
+type SecretStore struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// SecretSecureHistoryDevice holds the enrolled secure history device (JSON); with it, E2EE history is
+// readable without asking for the PIN again.
+const SecretSecureHistoryDevice = "secure_history_device"
+
 type MessageSendResult struct {
 	ClientID  string  `json:"client_id"`
 	Status    string  `json:"status"`
@@ -110,8 +128,9 @@ type Cookie struct {
 	Expires int64  `json:"expires,omitempty"`
 }
 type LoginArgs struct {
-	Cookies  []Cookie `json:"cookies"`
-	Platform string   `json:"platform"`
+	Cookies  []Cookie          `json:"cookies"`
+	Platform string            `json:"platform"`
+	Secrets  map[string]string `json:"secrets,omitempty"` // from earlier secret_store events
 }
 type RestoreHistoryArgs struct {
 	PIN string `json:"pin"`
@@ -122,10 +141,16 @@ type ReconnectArgs struct{}
 type ListConversationsArgs struct {
 	Cursor *string `json:"cursor,omitempty"`
 }
+
+// FetchMessagesArgs pages backwards through a conversation. Without a cursor it starts at the oldest
+// message the core has in memory; Cursor is the opaque value of the previous response.
 type FetchMessagesArgs struct {
-	ConversationID string `json:"conversation_id"`
-	BeforeTS       *int64 `json:"before_ts,omitempty"`
-	Limit          int    `json:"limit"`
+	ConversationID string  `json:"conversation_id"`
+	Cursor         *string `json:"cursor,omitempty"`
+	Limit          int     `json:"limit"`
+}
+type FetchConversationsArgs struct {
+	Cursor *string `json:"cursor,omitempty"`
 }
 type SendTextArgs struct {
 	ConversationID string `json:"conversation_id"`

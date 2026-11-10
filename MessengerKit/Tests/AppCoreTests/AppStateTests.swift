@@ -11,6 +11,185 @@ struct AppStateTests {
         .messageSendResult(MessageSendResult(clientID: id, status: status, messageID: messageID))
     }
 
+    @Test func testOlderCursorAndRestoreReset() async throws {
+        let (state, link, _) = try await loggedInState()
+        await state.open(conversationID: "u:2")
+        await link.enqueue(CoreResponse(ok: true, data: .object([
+            "has_more": .bool(true), "cursor": .string("opaque/+=="),
+        ])))
+        state.loadOlder(conversationID: "u:2")
+        state.loadOlder(conversationID: "u:2")
+        #expect(state.loadingOlder.contains("u:2"))
+        await state.lastCall?.value
+        await link.enqueue(CoreResponse(ok: true, data: .object([
+            "has_more": .bool(false), "cursor": .string("end"), "needs_restore": .bool(true),
+        ])))
+        try await Task.sleep(for: .seconds(5))
+        state.loadOlder(conversationID: "u:2", retry: true)
+        await state.lastCall?.value
+        let pages = await link.commands.filter { if case .fetchMessages = $0 { true } else { false } }
+        #expect(pages == [
+            .fetchMessages(conversationID: "u:2", cursor: nil, limit: 30),
+            .fetchMessages(conversationID: "u:2", cursor: "opaque/+==", limit: 30),
+        ])
+        #expect(state.needsPINForOlder(conversationID: "u:2"))
+        let count = await link.commands.count
+        state.loadOlder(conversationID: "u:2")
+        await state.lastCall?.value
+        #expect(await link.commands.count == count)
+
+        await link.enqueue(CoreResponse(ok: true, data: .object([
+            "has_more": .bool(false), "cursor": .string("other-end"),
+        ])))
+        state.loadOlder(conversationID: "u:1")
+        await state.lastCall?.value
+
+        await state.apply(.historyRestoreState(HistoryRestoreState(state: "done")))
+        await state.lastCall?.value
+        #expect(!state.needsPINForOlder(conversationID: "u:2"))
+        #expect(await link.commands.last == .fetchMessages(conversationID: "u:2", cursor: nil, limit: 30))
+        state.loadOlder(conversationID: "u:1")
+        await state.lastCall?.value
+        #expect(await link.commands.last == .fetchMessages(conversationID: "u:1", cursor: nil, limit: 30))
+    }
+
+    @Test func testRestoreCanRetryAfterSkipAndFailure() async throws {
+        let (state, link, keychain) = try await loggedInState()
+        state.skipHistoryRestore()
+        await state.lastCall?.value
+        await state.apply(.historyRestoreState(HistoryRestoreState(state: "skipped")))
+        state.restoreHistory(pin: "000000")
+        state.restoreHistory(pin: "000000")
+        #expect(state.historyRestore.state == "in_progress")
+        await state.lastCall?.value
+        await state.apply(.historyRestoreState(HistoryRestoreState(state: "failed", reason: "wrong_pin", attemptsRemaining: 4)))
+        #expect(state.historyRestore.attemptsRemaining == 4)
+        state.restoreHistory(pin: "123456")
+        await state.lastCall?.value
+        let restores = await link.commands.filter { if case .restoreHistory = $0 { true } else { false } }
+        #expect(restores == [.restoreHistory(pin: "000000"), .restoreHistory(pin: "123456")])
+        #expect(try SessionStore(keychain: keychain).loadSecret(key: "pin", cUser: "100") == nil)
+    }
+
+    @Test func testConversationPaginationStopsAtEnd() async throws {
+        let (state, link, _) = try await loggedInState()
+        await link.enqueue(CoreResponse(ok: true, data: .object(["has_more": .bool(true), "cursor": .string("page-2")])))
+        state.loadMoreConversations()
+        state.loadMoreConversations()
+        #expect(state.isLoadingConversations)
+        await state.lastCall?.value
+        await link.enqueue(CoreResponse(ok: true, data: .object(["has_more": .bool(false)])))
+        state.loadMoreConversations()
+        await state.lastCall?.value
+        state.loadMoreConversations()
+        let pages = await link.commands.filter { if case .fetchConversations = $0 { true } else { false } }
+        #expect(pages == [.fetchConversations(cursor: nil), .fetchConversations(cursor: "page-2")])
+        #expect(!state.hasMoreConversations)
+        #expect(!state.isLoadingConversations)
+    }
+
+    @Test func testSecretStoredOverwrittenSentOnLoginAndDeletedOnLogout() async throws {
+        let env = ResumeEnv()
+        defer { env.cleanUp() }
+        let first = env.makeState(MockLink())
+        await first.login(cookies: sessionCookies)
+        await first.apply(.secretStore(SecretStore(key: "secure_history_device", value: "old-device")))
+        await first.apply(.secretStore(SecretStore(key: "secure_history_device", value: "new-device")))
+        let session = SessionStore(keychain: env.keychain)
+        #expect(try session.loadSecret(key: "secure_history_device", cUser: "100") == "new-device")
+        let link = MockLink()
+        let resumed = env.makeState(link)
+        #expect(await resumed.resumeSavedSession() == .resumed)
+        let secrets = await link.commands.compactMap { cmd -> [String: String]? in
+            if case .login(_, _, let secrets) = cmd { secrets } else { nil }
+        }
+        #expect(secrets == [["secure_history_device": "new-device"]])
+        await resumed.logout()
+        #expect(try session.loadSecret(key: "secure_history_device", cUser: "100") == nil)
+    }
+
+    @Test func testEmptySecretEventDeletesKeychainItem() async throws {
+        let (state, _, keychain) = try await loggedInState()
+        let session = SessionStore(keychain: keychain)
+        await state.apply(.secretStore(SecretStore(key: SessionStore.historySecretKey, value: "test-device")))
+        #expect(try session.loadSecret(key: SessionStore.historySecretKey, cUser: "100") != nil)
+        await state.apply(.secretStore(SecretStore(key: SessionStore.historySecretKey, value: "")))
+        #expect(try session.loadSecret(key: SessionStore.historySecretKey, cUser: "100") == nil)
+    }
+
+    @Test func testAccountSwitchDeletesPreviousSecretsAndCookies() async throws {
+        let env = ResumeEnv()
+        defer { env.cleanUp() }
+        let state = env.makeState(MockLink())
+        await state.login(cookies: sessionCookies)
+        await state.apply(.secretStore(SecretStore(key: SessionStore.historySecretKey, value: "test-device")))
+        // Một AppState mới vẫn phải dọn tài khoản lưu từ phiên trước.
+        let switched = env.makeState(MockLink())
+        await switched.login(cookies: otherAccountCookies)
+        #expect(switched.isLoggedIn)
+        let session = SessionStore(keychain: env.keychain)
+        #expect(try session.loadSecret(key: SessionStore.historySecretKey, cUser: "100") == nil)
+        #expect(try session.loadCookies(cUser: "100") == nil)
+        #expect(try session.loadCookies(cUser: "200") != nil)
+    }
+
+    @Test func testSecretReadFailureStillLogsInWithoutSecrets() async throws {
+        let keychain = MemoryKeychain()
+        keychain.rejectSecretReads()
+        let (state, link, _) = try await loggedInState(keychain: keychain)
+        #expect(state.isLoggedIn)
+        #expect(state.loginError == nil)
+        let secrets = await link.commands.compactMap { cmd -> [String: String]?? in
+            if case .login(_, _, let s) = cmd { return .some(s) } else { return nil }
+        }
+        #expect(secrets.count == 1)
+        #expect(secrets.first == .some(nil))
+    }
+
+    @Test func testNeedsRestoreErrorExhaustsUntilRestoreDone() async throws {
+        let (state, link, _) = try await loggedInState()
+        await state.open(conversationID: "u:2")
+        await link.enqueue(CoreResponse(ok: false, error: CoreError(code: "needs_restore", message: "restore required")))
+        state.loadOlder(conversationID: "u:2")
+        await state.lastCall?.value
+        #expect(state.needsPINForOlder(conversationID: "u:2"))
+        #expect(state.olderError["u:2"] == nil)
+        let count = await link.commands.count
+        state.loadOlder(conversationID: "u:2", retry: true)
+        await state.lastCall?.value
+        #expect(await link.commands.count == count)
+        await state.apply(.historyRestoreState(HistoryRestoreState(state: "done")))
+        await state.lastCall?.value
+        #expect(await link.commands.count == count + 1)
+        await state.apply(.historyRestoreState(HistoryRestoreState(state: "needed")))
+        #expect(state.historyRestore.state == "needed")
+        #expect(state.needsPINForOlder(conversationID: "u:2"))
+    }
+
+    @Test func testOlderFailureIsPerConversationAndDoesNotAutoRetry() async throws {
+        let (state, link, _) = try await loggedInState()
+        await link.enqueue(CoreResponse(ok: false, error: CoreError(code: "timeout", message: "timeout")))
+        state.loadOlder(conversationID: "u:2")
+        await state.lastCall?.value
+        #expect(state.olderError["u:2"]?.code == "timeout")
+        #expect(state.olderError["u:1"] == nil)
+        let count = await link.commands.count
+        state.loadOlder(conversationID: "u:2")
+        state.loadOlder(conversationID: "u:2", retry: true)
+        await state.lastCall?.value
+        #expect(await link.commands.count == count)
+    }
+
+    @Test func testMixedPagesSortByTimestampAndID() async throws {
+        let (state, _, _) = try await loggedInState()
+        await state.open(conversationID: "u:1")
+        for (id, ts) in [("b", 20), ("z", 10), ("a", 20), ("c", 30)] {
+            await state.apply(.messageUpsert(Message(id: id, conversationID: "u:1", threadID: "u:1",
+                                                   senderID: "1", isOutgoing: false, ts: Int64(ts), text: id)))
+        }
+        #expect(state.messages(for: "u:1").map(\.id) == ["z", "a", "b", "c"])
+    }
+
     @Test func testUnknownStatusShownAndNotAutoRetried() async throws {
         let (state, link, _) = try await loggedInState()
         await state.open(conversationID: "u:1")
@@ -99,7 +278,7 @@ struct AppStateTests {
         let state = env.makeState(link)
         #expect(await state.resumeSavedSession() == .resumed)
         let sent = await link.commands.compactMap { cmd -> [CookieParam]? in
-            if case .login(let cookies, _) = cmd { cookies } else { nil }
+            if case .login(let cookies, _, _) = cmd { cookies } else { nil }
         }
         #expect(sent.first?.first(where: { $0.name == "xs" })?.value == "xs-old")
 

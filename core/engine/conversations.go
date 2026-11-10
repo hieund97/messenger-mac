@@ -43,6 +43,23 @@ type convEntry struct {
 	linked        bool   // seen in LSCreateOpenToE2EEThreadLink
 	threadName    string
 	threadPicture string
+	// Oldest message the core has handled per thread: fetch_messages without a cursor starts there.
+	oldestLS msgPos
+	oldestWA msgPos
+}
+
+// msgPos is a position in a thread, ordered by (ts, id) so messages with the same timestamp are kept apart.
+type msgPos struct {
+	ts int64
+	id string
+}
+
+func (p msgPos) before(q msgPos) bool { return p.ts < q.ts || (p.ts == q.ts && p.id < q.id) }
+
+func (p *msgPos) lower(ts int64, id string) {
+	if q := (msgPos{ts, id}); p.id == "" || q.before(*p) {
+		*p = q
+	}
 }
 
 // ThreadIndex maps Lightspeed thread keys and E2EE JIDs onto conversations. Normal threads use the
@@ -74,6 +91,17 @@ type ThreadIndex struct {
 	// historyMuted holds Lightspeed thread keys whose upserted (history) messages are not emitted until
 	// the given time: a media URL refresh re-fetches a page of old messages that Swift did not ask for.
 	historyMuted map[int64]time.Time
+	// collectors receive the upserted history of thread keys a fetch_messages is paging through.
+	collectors map[int64]*lsCollector
+	// historyRestored is true while a secure history device is enrolled; it sets history_restored of
+	// conversations with an E2EE thread.
+	historyRestored bool
+}
+
+// lsCollector takes the next history batch of one thread (backfill.go BackfillCollector, one batch).
+type lsCollector struct {
+	anchorTS int64
+	ch       chan *table.UpsertMessages
 }
 
 type waIncoming struct {
@@ -102,6 +130,7 @@ func NewThreadIndex(selfID int64) *ThreadIndex {
 		waClient:     map[string]string{},
 		waUnread:     map[string][]waIncoming{},
 		historyMuted: map[int64]time.Time{},
+		collectors:   map[int64]*lsCollector{},
 	}
 }
 
@@ -203,6 +232,59 @@ func (x *ThreadIndex) refresh(e *convEntry) {
 		avatar = c.avatar
 	}
 	e.conv.AvatarURL = optString(avatar)
+	// Normal threads always have their history; an E2EE thread needs the secure history restored.
+	e.conv.HistoryRestored = e.e2eeThread == "" || x.historyRestored
+}
+
+// SetHistoryRestored updates history_restored of every conversation with an E2EE thread.
+func (x *ThreadIndex) SetHistoryRestored(restored bool, emit func(Event)) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.historyRestored == restored {
+		return
+	}
+	x.historyRestored = restored
+	if emit == nil {
+		emit = func(Event) {}
+	}
+	for _, e := range x.convs {
+		if e.e2eeThread != "" {
+			x.update(e.peer, emit, nil)
+		}
+	}
+}
+
+// addCollector registers the collector of the next history batch of thread key. Only one fetch pages a
+// thread at a time.
+func (x *ThreadIndex) addCollector(key, anchorTS int64) (*lsCollector, bool) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if _, busy := x.collectors[key]; busy {
+		return nil, false
+	}
+	c := &lsCollector{anchorTS: anchorTS, ch: make(chan *table.UpsertMessages, 1)}
+	x.collectors[key] = c
+	return c, true
+}
+
+func (x *ThreadIndex) removeCollector(key int64, c *lsCollector) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if x.collectors[key] == c {
+		delete(x.collectors, key)
+	}
+}
+
+// collect hands an upsert to the collector of its thread. Like handleUpsertMessages it ignores ranges
+// newer than the anchor: a late answer to an earlier batch. Called with x.mu held.
+func (x *ThreadIndex) collect(key int64, upsert *table.UpsertMessages) bool {
+	c := x.collectors[key]
+	if c == nil || upsert.Range == nil || (c.anchorTS > 0 && upsert.Range.MaxTimestampMsTemplate > c.anchorTS) {
+		return false
+	}
+	delete(x.collectors, key)
+	c.ch <- upsert
+	return true
 }
 
 func ptrEqual[T comparable](a, b *T) bool {
@@ -490,7 +572,7 @@ func (x *ThreadIndex) ApplyTable(tbl *table.LSTable, emit func(Event)) {
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 	for _, k := range keys {
-		if x.historyIsMuted(k) {
+		if x.collect(k, upsert[k]) || x.historyIsMuted(k) {
 			continue
 		}
 		msgs = append(msgs, upsert[k].Messages...)
@@ -498,6 +580,13 @@ func (x *ThreadIndex) ApplyTable(tbl *table.LSTable, emit func(Event)) {
 	msgs = append(msgs, insert...)
 	for _, msg := range msgs {
 		x.applyLSMessage(msg, emit)
+	}
+	// backfill.go handleUpdateExistingMessageRange: the server answers a batch with nothing before the
+	// anchor by updating the range instead of upserting messages.
+	for _, rng := range tbl.LSUpdateExistingMessageRange {
+		if c := x.collectors[rng.ThreadKey]; c != nil && c.anchorTS == rng.TimestampMS {
+			x.collect(rng.ThreadKey, &table.UpsertMessages{Range: &table.LSInsertNewMessageRange{ThreadKey: rng.ThreadKey}})
+		}
 	}
 }
 
@@ -551,6 +640,9 @@ func (x *ThreadIndex) applyLSMessage(msg *table.WrappedMessage, emit func(Event)
 		return
 	}
 	x.markSeen(msg.MessageId)
+	if msg.ThreadKey == e.normalThread {
+		e.oldestLS.lower(m.TS, m.ID)
+	}
 	m.ConversationID = e.conv.ID
 	x.update(e.peer, emit, func(e *convEntry) { x.touch(e, m.TS, messagePreview(m)) })
 	emit(Event{Type: EventMessageUpsert, Data: m})
@@ -585,6 +677,7 @@ func (x *ThreadIndex) ApplyWAMessage(evt *events.FBMessage, emit func(Event)) {
 	x.markSeen(evt.Info.ID)
 	x.update(peer, emit, func(e *convEntry) {
 		e.e2eeThread = chat.ToNonAD().String()
+		e.oldestWA.lower(m.TS, m.ID)
 		x.touch(e, m.TS, messagePreview(m))
 	})
 	if !m.IsOutgoing {
@@ -719,6 +812,7 @@ func (b *MetaBackend) onConnected(client metaClient) {
 	if e2ee != nil {
 		e2ee.start()
 	}
+	b.announceHistory(client)
 }
 
 // fetchE2EEThreads loads the E2EE (group 95) thread list after connecting, following
@@ -753,39 +847,49 @@ func (b *MetaBackend) fetchE2EEThreads(ctx context.Context, client metaClient, r
 		if b.sink(client) == nil {
 			return
 		}
-		keyStore := rc.GetSyncGroupKeyStore(e2eeSyncGroup)
-		if page == 0 && (keyStore == nil || (!keyStore.HasMoreBefore && keyStore.MinThreadKey == 0)) {
-			// The key store was never filled, so FetchMoreThreads would return nothing. messagix keeps
-			// only the cutover links of the db-95 snapshot it fetches at page load (syncManager.go:262);
-			// fetch that snapshot again and keep the whole table. It is not paged.
-			tbl, err := snapshotE2EEThreads(ctx, rc)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to fetch E2EE thread snapshot")
-			} else if tbl != nil {
-				b.handleTable(client, tbl)
-			}
-			return
-		}
-		if keyStore == nil || !keyStore.HasMoreBefore {
-			return
-		}
-		prevMin := keyStore.MinThreadKey
-		gen := rc.ThreadRangeGeneration(e2eeSyncGroup)
-		_, tbl, err := rc.FetchMoreThreads(ctx, e2eeSyncGroup)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to fetch more E2EE threads")
-			return
-		} else if tbl == nil {
-			return
-		}
-		b.handleTable(client, tbl)
-		if err = wait(threadRangeTimeout, func(c context.Context) error { return rc.WaitForThreadRange(c, e2eeSyncGroup, gen) }); err != nil {
-			return
-		}
-		if keyStore.HasMoreBefore && keyStore.MinThreadKey == prevMin {
+		// fetch_conversations pages the same key store; never request the same page twice at once.
+		b.threadPaging.Lock()
+		stop := b.fetchE2EEThreadPage(ctx, client, rc, page, wait, log)
+		b.threadPaging.Unlock()
+		if stop {
 			return
 		}
 	}
+}
+
+// fetchE2EEThreadPage loads one page of fetchE2EEThreads; true ends the paging.
+func (b *MetaBackend) fetchE2EEThreadPage(ctx context.Context, client metaClient, rc *realMetaClient, page int,
+	wait func(time.Duration, func(context.Context) error) error, log zerolog.Logger) bool {
+	keyStore := rc.GetSyncGroupKeyStore(e2eeSyncGroup)
+	if page == 0 && (keyStore == nil || (!keyStore.HasMoreBefore && keyStore.MinThreadKey == 0)) {
+		// The key store was never filled, so FetchMoreThreads would return nothing. messagix keeps
+		// only the cutover links of the db-95 snapshot it fetches at page load (syncManager.go:262);
+		// fetch that snapshot again and keep the whole table. It is not paged.
+		tbl, err := snapshotE2EEThreads(ctx, rc)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to fetch E2EE thread snapshot")
+		} else if tbl != nil {
+			b.handleTable(client, tbl)
+		}
+		return true
+	}
+	if keyStore == nil || !keyStore.HasMoreBefore {
+		return true
+	}
+	prevMin := keyStore.MinThreadKey
+	gen := rc.ThreadRangeGeneration(e2eeSyncGroup)
+	_, tbl, err := rc.FetchMoreThreads(ctx, e2eeSyncGroup)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to fetch more E2EE threads")
+		return true
+	} else if tbl == nil {
+		return true
+	}
+	b.handleTable(client, tbl)
+	if err = wait(threadRangeTimeout, func(c context.Context) error { return rc.WaitForThreadRange(c, e2eeSyncGroup, gen) }); err != nil {
+		return true
+	}
+	return keyStore.HasMoreBefore && keyStore.MinThreadKey == prevMin
 }
 
 // snapshotE2EEThreads repeats the db-95 request of SyncDataGraphQL. The sync cursors are not touched:

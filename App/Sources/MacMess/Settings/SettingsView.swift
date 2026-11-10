@@ -17,7 +17,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("Tin nhắn mã hóa") {
-                Button("Nhập PIN khôi phục lịch sử…") { showPIN = true }
+                Button("Khôi phục lịch sử chat bảo mật…") { showPIN = true }
                     .disabled(!state.isLoggedIn)
             }
             Section("Tài khoản") {

@@ -22,6 +22,7 @@ type Backend interface {
 	Reconnect(context.Context, ReconnectArgs, func(Event)) error
 	ListConversations(context.Context, ListConversationsArgs, func(Event)) error
 	FetchMessages(context.Context, FetchMessagesArgs, func(Event)) error
+	FetchConversations(context.Context, FetchConversationsArgs, func(Event)) error
 	SendText(context.Context, SendTextArgs, func(Event)) error
 	SendMedia(context.Context, SendMediaArgs, func(Event)) error
 	MarkRead(context.Context, MarkReadArgs, func(Event)) error
@@ -46,7 +47,7 @@ func New(cfg Config, emit func(Event)) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{emit: emit, ctx: ctx, cancel: cancel}
 	if cfg.Backend == "fake" {
-		e.backend = FakeBackend{}
+		e.backend = NewFakeBackend()
 	} else if cfg.Backend == "" || cfg.Backend == "meta" {
 		e.backend = NewMetaBackend(cfg)
 	}
@@ -113,10 +114,28 @@ func responseSent(ctx context.Context) <-chan struct{} {
 	return ch
 }
 
+// responseDataKey carries where a backend puts the data of a successful response.
+type responseDataKey struct{}
+
+// setResponseData sets the data of the command's successful response. Outside a command it does nothing.
+func setResponseData(ctx context.Context, data any) error {
+	slot, _ := ctx.Value(responseDataKey{}).(*json.RawMessage)
+	if slot == nil {
+		return nil
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	*slot = raw
+	return nil
+}
+
 func (e *Engine) run(id int64, raw []byte) {
 	response := Response{OK: true}
 	responded := make(chan struct{})
-	ctx := context.WithValue(e.ctx, responseSentKey{}, responded)
+	var data json.RawMessage
+	ctx := context.WithValue(context.WithValue(e.ctx, responseSentKey{}, responded), responseDataKey{}, &data)
 	defer func() {
 		if recover() != nil {
 			response = Response{Error: &Error{Code: "internal", Message: "backend panic"}}
@@ -154,6 +173,8 @@ func (e *Engine) run(id int64, raw []byte) {
 		call, err = decodeArgs(req.Args, ctx, emit, e.backend.ListConversations)
 	case CmdFetchMessages:
 		call, err = decodeArgs(req.Args, ctx, emit, e.backend.FetchMessages)
+	case CmdFetchConversations:
+		call, err = decodeArgs(req.Args, ctx, emit, e.backend.FetchConversations)
 	case CmdSendText:
 		call, err = decodeArgs(req.Args, ctx, emit, e.backend.SendText)
 	case CmdSendMedia:
@@ -177,6 +198,8 @@ func (e *Engine) run(id int64, raw []byte) {
 		} else {
 			fail("internal", err.Error())
 		}
+	} else if len(data) > 0 {
+		response.Data = data
 	}
 }
 

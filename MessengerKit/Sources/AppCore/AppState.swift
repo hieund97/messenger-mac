@@ -3,6 +3,7 @@ import CoreBridge
 import Foundation
 import LocalStore
 import Observation
+import os
 import UniformTypeIdentifiers
 
 /// Phần của CoreBridge mà AppState dùng; tách ra để test thay bằng bản giả.
@@ -59,10 +60,25 @@ public final class AppState {
     public private(set) var isLoggingIn = false
     /// Đã đăng nhập vào lõi (có phiên đang chạy).
     public private(set) var isLoggedIn = false
-    @ObservationIgnored private var exhausted: Set<String> = []
+    private var exhausted: Set<String> = []
     @ObservationIgnored private var downloading: Set<String> = []
     @ObservationIgnored private var downloaded: [String: URL] = [:]
-    @ObservationIgnored private var loadingOlder: Set<String> = []
+    private static let logger = Logger(subsystem: "dev.hieund.macmess", category: "Session")
+    public private(set) var olderError: [String: CoreError] = [:]
+    public private(set) var conversationsError: CoreError?
+    public private(set) var olderPaused: Set<String> = []
+    @ObservationIgnored private var olderRetryAt: [String: ContinuousClock.Instant] = [:]
+    public private(set) var loadingOlder: Set<String> = []
+    public private(set) var needsHistoryRestore: Set<String> = []
+    /// Hội thoại đã biết có phần E2EE (từng cần khôi phục); dùng khi lõi báo `needed` lại giữa phiên.
+    @ObservationIgnored private var e2eeConversations: Set<String> = []
+    public private(set) var isLoadingConversations = false
+    public private(set) var hasMoreConversations = true
+    @ObservationIgnored private var messageCursors: [String: String] = [:]
+    @ObservationIgnored private var conversationCursor: String?
+    @ObservationIgnored private var activeConversationID: String?
+    @ObservationIgnored private var sessionGeneration = UUID()
+    @ObservationIgnored private var historyGeneration = UUID()
     @ObservationIgnored private var lastOlderAt: [String: ContinuousClock.Instant] = [:]
     @ObservationIgnored private var observers: [UUID: AsyncStream<CoreEvent>.Continuation] = [:]
     /// Task của lệnh gần nhất (test dùng để chờ).
@@ -119,10 +135,19 @@ public final class AppState {
 
     /// Nạp 50 tin cuối của hội thoại vào cache. UI gọi khi người dùng mở hội thoại.
     public func open(conversationID: String) async {
-        guard let store else { return }
+        activeConversationID = conversationID
+        guard let store, messageCache[conversationID] == nil else { return }
         if let list = try? await store.messages(conversationID: conversationID, limit: Self.windowSize) {
             messageCache[conversationID] = list
         }
+    }
+
+    public func close(conversationID: String) {
+        if activeConversationID == conversationID { activeConversationID = nil }
+    }
+
+    public func needsPINForOlder(conversationID: String) -> Bool {
+        needsHistoryRestore.contains(conversationID) || conversations.first(where: { $0.id == conversationID })?.historyRestored == false
     }
 
     /// Phát lại mọi sự kiện của lõi (sau khi đã hợp nhất vào store) cho thành phần khác, ví dụ Notifier.
@@ -188,8 +213,16 @@ public final class AppState {
         // Đang ở auth_required thì giữ trạng thái này (AuthBanner) cho tới khi login mới thành công.
         let previousAuth: ConnectionState? = connection.isAuthRequired ? connection : nil
         func restoreAuth() { if let previousAuth { connection = previousAuth } }
+        let previousUser = cUser ?? defaults.string(forKey: Self.lastUserKey)
         await tearDown()
         restoreAuth()
+        if let previousUser, previousUser != user {
+            let session = session
+            try? await Task.detached { try session.deleteCookies(cUser: previousUser) }.value
+            try? await Task.detached {
+                try session.deleteSecret(key: SessionStore.historySecretKey, cUser: previousUser)
+            }.value
+        }
         cUser = user
         let params = cookies.map {
             CookieParam(name: $0.name, value: $0.value, domain: $0.domain, expires: $0.expires.map { Int64($0.timeIntervalSince1970) })
@@ -208,7 +241,12 @@ public final class AppState {
             eventTask = Task { [weak self] in
                 for await event in link.events { await self?.apply(event) }
             }
-            let resp = try await link.call(.login(cookies: params, platform: platform))
+            let session = session
+            let secret = try? await Task.detached {
+                try session.loadSecret(key: SessionStore.historySecretKey, cUser: user)
+            }.value
+            let secrets = secret.map { [SessionStore.historySecretKey: $0] }
+            let resp = try await link.call(.login(cookies: params, platform: platform, secrets: secrets))
             if resp.ok {
                 isLoggedIn = true
                 defaults.set(user, forKey: Self.lastUserKey)
@@ -265,19 +303,36 @@ public final class AppState {
         if let user = cUser {
             let session = session
             try? await Task.detached { try session.deleteCookies(cUser: user) }.value
+            try? await Task.detached {
+                try session.deleteSecret(key: SessionStore.historySecretKey, cUser: user)
+            }.value
         }
         cUser = nil
         defaults.removeObject(forKey: Self.lastUserKey)
     }
 
-    public func submitPIN(_ pin: String) {
-        guard let link else { return }
-        lastCall = Task { _ = try? await link.call(.restoreHistory(pin: pin)) }
+    public func restoreHistory(pin: String) {
+        guard let link, historyRestore.state != "in_progress" else { return }
+        historyRestore = HistoryRestoreState(state: "in_progress")
+        let generation = sessionGeneration
+        lastCall = Task {
+            do {
+                let response = try await link.call(.restoreHistory(pin: pin))
+                guard generation == sessionGeneration else { return }
+                if !response.ok {
+                    lastError = response.error
+                    historyRestore = HistoryRestoreState(state: "failed", reason: response.error?.code == "auth_required" ? "auth_required" : "other")
+                }
+            } catch {
+                guard generation == sessionGeneration else { return }
+                historyRestore = HistoryRestoreState(state: "failed", reason: "other")
+            }
+        }
     }
 
     /// Bỏ qua khôi phục lịch sử E2EE (nhập PIN sau ở Settings).
     public func skipHistoryRestore() {
-        guard let link else { return }
+        guard let link, historyRestore.state != "in_progress" else { return }
         lastCall = Task { _ = try? await link.call(.skipHistoryRestore) }
     }
 
@@ -340,20 +395,78 @@ public final class AppState {
     }
 
     /// Mỗi hội thoại chỉ một batch tại một thời điểm, cách nhau ≥ 1 giây.
-    public func loadOlder(conversationID: String) {
-        guard let link, let store, !loadingOlder.contains(conversationID), !exhausted.contains(conversationID) else { return }
+    public func loadOlder(conversationID: String, retry: Bool = false) {
+        guard let link, !loadingOlder.contains(conversationID), !exhausted.contains(conversationID) else { return }
+        if olderPaused.contains(conversationID) {
+            guard retry, let last = olderRetryAt[conversationID], ContinuousClock.now - last >= .seconds(5) else { return }
+        }
+        olderPaused.remove(conversationID)
+        olderError[conversationID] = nil
+        let previousIDs = Set(messages(for: conversationID).map(\.id))
         loadingOlder.insert(conversationID)
+        let generation = sessionGeneration
+        let history = historyGeneration
         lastCall = Task {
             if let last = lastOlderAt[conversationID] {
                 let wait = Self.olderBatchInterval - (ContinuousClock.now - last)
                 if wait > .zero { try? await Task.sleep(for: wait) }
             }
-            let before = try? await store.oldestTS(conversationID: conversationID)
-            let resp = try? await link.call(.fetchMessages(conversationID: conversationID, beforeTS: before, limit: 30))
-            // Lõi báo hết lịch sử thì không gọi nữa.
-            if case .object(let o)? = resp?.data, case .bool(false)? = o["has_more"] { exhausted.insert(conversationID) }
-            lastOlderAt[conversationID] = .now
+            guard generation == sessionGeneration else { return }
+            let resp = try? await link.call(.fetchMessages(conversationID: conversationID,
+                                                         cursor: messageCursors[conversationID], limit: 30))
+            guard generation == sessionGeneration else { return }
             loadingOlder.remove(conversationID)
+            // Một batch đang chạy khi restore xong không được ghi lại cursor cũ.
+            guard history == historyGeneration else {
+                if activeConversationID == conversationID { loadOlder(conversationID: conversationID) }
+                return
+            }
+            if let resp, resp.ok, case .object(let data)? = resp.data {
+                if case .string(let cursor)? = data["cursor"] { messageCursors[conversationID] = cursor }
+                if case .bool(false)? = data["has_more"] { exhausted.insert(conversationID) }
+                if case .bool(true)? = data["needs_restore"] {
+                    needsHistoryRestore.insert(conversationID)
+                    e2eeConversations.insert(conversationID)
+                }
+                else if historyRestore.state == "done" || historyRestore.state == "none" {
+                    needsHistoryRestore.remove(conversationID)
+                }
+            } else if resp?.error?.code == "needs_restore" {
+                exhausted.insert(conversationID)
+                needsHistoryRestore.insert(conversationID)
+                e2eeConversations.insert(conversationID)
+            } else {
+                let error = resp?.error ?? CoreError(code: "history_failed", message: "Không tải được tin nhắn cũ")
+                olderError[conversationID] = error
+                lastError = error
+            }
+            if !exhausted.contains(conversationID),
+               olderError[conversationID] != nil || Set(messages(for: conversationID).map(\.id)).subtracting(previousIDs).isEmpty {
+                olderPaused.insert(conversationID)
+                olderRetryAt[conversationID] = .now
+            }
+            lastOlderAt[conversationID] = .now
+        }
+    }
+
+    public func loadMoreConversations(retry: Bool = false) {
+        guard let link, connection.state == "connected", !isLoadingConversations,
+              hasMoreConversations, conversationsError == nil || retry else { return }
+        conversationsError = nil
+        isLoadingConversations = true
+        let generation = sessionGeneration
+        lastCall = Task {
+            let resp = try? await link.call(.fetchConversations(cursor: conversationCursor))
+            guard generation == sessionGeneration else { return }
+            isLoadingConversations = false
+            if let resp, resp.ok, case .object(let data)? = resp.data {
+                if case .string(let cursor)? = data["cursor"] { conversationCursor = cursor }
+                if case .bool(let more)? = data["has_more"] { hasMoreConversations = more }
+            } else {
+                let error = resp?.error ?? CoreError(code: "history_failed", message: "Không tải được hội thoại")
+                conversationsError = error
+                lastError = error
+            }
         }
     }
 
@@ -410,6 +523,21 @@ public final class AppState {
             connection = s
         case .historyRestoreState(let s):
             historyRestore = s
+            if s.state == "needed" {
+                e2eeConversations.formUnion(conversations.filter { $0.historyRestored == false }.map(\.id))
+                needsHistoryRestore.formUnion(e2eeConversations)
+            }
+            if s.state == "done" {
+                historyGeneration = UUID()
+                olderPaused.removeAll()
+                olderRetryAt.removeAll()
+                olderError.removeAll()
+                exhausted.removeAll()
+                messageCursors.removeAll()
+                needsHistoryRestore.removeAll()
+                lastOlderAt.removeAll()
+                if let id = activeConversationID { loadOlder(conversationID: id) }
+            }
         case .conversationUpsert(let c):
             if let store, let stored = try? await store.upsert(c) { put(stored) }
         case .messageUpsert(let m):
@@ -426,6 +554,17 @@ public final class AppState {
             // Đọc từ thiết bị khác của chính mình: chỉ trừ tin đến có ts ≤ until_ts.
             if r.readerID == cUser, let store, let c = try? await store.markRead(conversationID: r.conversationID, untilTS: r.untilTS) {
                 put(c)
+            }
+        case .secretStore(let secret):
+            if let user = cUser, secret.key == SessionStore.historySecretKey {
+                let session = session
+                do {
+                    try await Task.detached {
+                        try session.saveSecret(secret.value, key: secret.key, cUser: user)
+                    }.value
+                } catch {
+                    Self.logger.error("Không ghi được secret Keychain, key: \(secret.key, privacy: .private)")
+                }
             }
         case .cookiesUpdated(let cookies):
             if let user = cUser { try? await persistCookies(cookies, user: user) }
@@ -502,7 +641,7 @@ public final class AppState {
             return
         }
         list.removeAll { change.removedIDs.contains($0.id) || $0.id == m.id }
-        let index = list.lastIndex { $0.ts <= m.ts }.map { $0 + 1 } ?? 0
+        let index = list.lastIndex { $0.ts < m.ts || ($0.ts == m.ts && $0.id <= m.id) }.map { $0 + 1 } ?? 0
         list.insert(m, at: index)
         messageCache[m.conversationID] = list
     }
@@ -514,10 +653,12 @@ public final class AppState {
 
     /// Dừng lõi, đóng store và xoá state của phiên.
     private func tearDown() async {
+        sessionGeneration = UUID()
         let link = link
         self.link = nil
         if let link { await link.shutdown() }
         eventTask?.cancel()
+        await eventTask?.value
         eventTask = nil
         try? store?.close()
         store = nil
@@ -529,9 +670,20 @@ public final class AppState {
         historyRestore = HistoryRestoreState(state: "none")
         isLoggedIn = false
         exhausted = []
+        messageCursors = [:]
+        needsHistoryRestore = []
+        e2eeConversations = []
+        conversationCursor = nil
+        hasMoreConversations = true
+        isLoadingConversations = false
+        activeConversationID = nil
         downloading = []
         downloaded = [:]
         connection = .disconnected
+        olderError = [:]
+        conversationsError = nil
+        olderPaused = []
+        olderRetryAt = [:]
         loadingOlder = []
         lastOlderAt = [:]
     }

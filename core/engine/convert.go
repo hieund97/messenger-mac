@@ -232,6 +232,12 @@ func waMediaOf(content *waConsumerApplication.ConsumerApplication_Content) (*waM
 // fromWA converts an E2EE consumer message. ok is false for events without displayable consumer content
 // (armadillo metadata sync, receipts in disguise, empty payloads).
 func fromWA(evt *events.FBMessage, convID string, selfID int64, clientID *string) (Message, bool) {
+	return fromWAWithPaths(evt, convID, selfID, clientID, nil)
+}
+
+// fromWAWithPaths is fromWA for secure history entries, whose media may live at another path: paths
+// maps the transport's object ID to it (msgconv reuploadWhatsAppAttachment, ContextKeyWAMediaPaths).
+func fromWAWithPaths(evt *events.FBMessage, convID string, selfID int64, clientID *string, paths map[string]string) (Message, bool) {
 	content := evt.GetConsumerApplication().GetPayload().GetContent()
 	if content == nil || content.GetContent() == nil {
 		return Message{}, false
@@ -259,8 +265,13 @@ func fromWA(evt *events.FBMessage, convID string, selfID int64, clientID *string
 		if mime == "" {
 			mime = media.defaultMIME
 		}
+		directPath := integral.GetDirectPath()
+		// whatsmeow only downloads plain paths; anything else (a full CDN URL) keeps the original path.
+		if p := paths[ancillary.GetObjectID()]; p != "" && validDirectPath(p) {
+			directPath = p
+		}
 		m.Attachments = append(m.Attachments, Attachment{
-			Ref: encodeMediaRef(mediaRef{Kind: mediaRefWA, DirectPath: integral.GetDirectPath(), MediaType: media.mediaType,
+			Ref: encodeMediaRef(mediaRef{Kind: mediaRefWA, DirectPath: directPath, MediaType: media.mediaType,
 				MediaKey: integral.GetMediaKey(), SHA256: integral.GetFileSHA256(), EncSHA256: integral.GetFileEncSHA256(), MIME: mime}),
 			Kind:     media.kind,
 			MIME:     mime,

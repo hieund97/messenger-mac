@@ -91,8 +91,8 @@ public final class LocalStore: Sendable {
     public func messages(conversationID: String, limit: Int) async throws -> [Message] {
         try await writer.read { db in
             let rows = try Row.fetchAll(db, sql: """
-                SELECT * FROM (SELECT rowid AS rid, * FROM message WHERE conversation_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?)
-                ORDER BY ts, rid
+                SELECT * FROM (SELECT * FROM message WHERE conversation_id = ? ORDER BY ts DESC, id DESC LIMIT ?)
+                ORDER BY ts, id
                 """, arguments: [conversationID, limit])
             return try Self.messages(rows, db)
         }
@@ -102,13 +102,6 @@ public final class LocalStore: Sendable {
         try await writer.read { db in
             guard let id = try String.fetchOne(db, sql: "SELECT id FROM message WHERE client_id = ?", arguments: [clientID]) else { return nil }
             return try Self.fetch(id: id, db)
-        }
-    }
-
-    /// `ts` nhỏ nhất đã có của hội thoại, dùng làm mốc `loadOlder`.
-    public func oldestTS(conversationID: String) async throws -> Int64? {
-        try await writer.read { db in
-            try Int64.fetchOne(db, sql: "SELECT MIN(ts) FROM message WHERE conversation_id = ?", arguments: [conversationID])
         }
     }
 
