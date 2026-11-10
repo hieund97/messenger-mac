@@ -5,28 +5,18 @@ struct PINEntryView: View {
     @Environment(AppState.self) private var state
     var onSkip: () -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var digits = Array(repeating: "", count: 6)
+    @State private var pin = ""
     @State private var hasSubmitted = false
-    @FocusState private var focus: Int?
+    @FocusState private var focused: Bool
 
-    private var pin: String { digits.joined() }
+    private var inProgress: Bool { state.historyRestore.state == "in_progress" }
 
     var body: some View {
         VStack(spacing: 16) {
             Text("Khôi phục lịch sử tin nhắn mã hóa").font(.title3.bold())
             Text("Nhập mã PIN 6 số bạn đã đặt cho tin nhắn mã hóa đầu cuối.")
                 .font(.callout).foregroundStyle(.secondary)
-            HStack(spacing: 8) {
-                ForEach(0..<6, id: \.self) { i in
-                    SecureField("", text: Binding(get: { digits[i] }, set: { handle(i, $0) }))
-                        .multilineTextAlignment(.center)
-                        .frame(width: 36, height: 44)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.title2.monospacedDigit())
-                        .focused($focus, equals: i)
-                        .disabled(state.historyRestore.state == "in_progress")
-                }
-            }
+            pinBoxes
             if hasSubmitted, state.historyRestore.state == "failed" {
                 Text(state.historyRestore.failureMessage).foregroundStyle(.red).font(.callout)
             }
@@ -44,39 +34,62 @@ struct PINEntryView: View {
         .padding(28)
         .frame(minWidth: 400)
         .interactiveDismissDisabled()
-        .onAppear { focus = 0 }
-        .onDisappear { digits = Array(repeating: "", count: 6) }
+        .onAppear { focused = true }
+        .onDisappear { pin = "" }
         .onChange(of: state.historyRestore.state) { _, new in
             if new == "done" { dismiss() }
             if new == "failed" {
-                digits = Array(repeating: "", count: 6)
-                focus = 0
+                pin = ""
+                focused = true
             }
         }
     }
 
-    private func handle(_ i: Int, _ new: String) {
-        var filtered = new.filter { $0 >= "0" && $0 <= "9" }
-        if filtered.count == 2, !digits[i].isEmpty, filtered.hasPrefix(digits[i]) {
-            filtered = String(filtered.suffix(1))
+    // Một SecureField ẩn nhận toàn bộ phím gõ/dán; 6 ô chỉ để hiển thị nên không có đổi focus giữa các field.
+    private var pinBoxes: some View {
+        ZStack {
+            SecureField("", text: Binding(get: { pin }, set: { handle($0) }))
+                .focused($focused)
+                .textFieldStyle(.plain)
+                .focusEffectDisabled()
+                .opacity(0)
+                .allowsHitTesting(false)
+                .disabled(inProgress)
+            HStack(spacing: 8) {
+                ForEach(0..<6, id: \.self) { i in
+                    let active = focused && i == min(pin.count, 5)
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color(nsColor: .textBackgroundColor))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(active ? Color.accentColor : Color.secondary.opacity(0.4),
+                                        lineWidth: active ? 2 : 1)
+                        )
+                        .overlay { if i < pin.count { Circle().fill(.primary).frame(width: 10, height: 10) } }
+                        .frame(width: 36, height: 44)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { if !inProgress { focused = true } }
         }
-        if filtered.count > 1 {
-            // Dán đủ sáu số ở bất kỳ ô nào cũng điền toàn bộ PIN.
-            let start = filtered.count >= 6 ? 0 : i
-            for (k, ch) in filtered.prefix(6 - start).enumerated() { digits[start + k] = String(ch) }
-            focus = min(start + filtered.count, 5)
-        } else {
-            digits[i] = filtered
-            if !filtered.isEmpty, i < 5 { focus = i + 1 }
-            if filtered.isEmpty, i > 0 { focus = i - 1 }
+    }
+
+    private func handle(_ new: String) {
+        var filtered = String(new.filter { $0 >= "0" && $0 <= "9" })
+        // Đủ 6 số mà gõ thêm 1 số: thay số cuối bằng số mới.
+        if pin.count == 6, filtered.count == 7, filtered.hasPrefix(pin) {
+            filtered = String(pin.prefix(5)) + String(filtered.suffix(1))
         }
+        // Dán nguyên 6 số khi ô đang có số: lấy đúng chuỗi vừa dán.
+        if filtered.count > 6, filtered.count - pin.count >= 6 { filtered = String(filtered.suffix(6)) }
+        pin = String(filtered.prefix(6))
     }
 
     private func submit() {
         guard pin.count == 6 else { return }
         hasSubmitted = true
         state.restoreHistory(pin: pin)
-        digits = Array(repeating: "", count: 6)
-        focus = 0
+        pin = ""
+        focused = true
     }
 }
