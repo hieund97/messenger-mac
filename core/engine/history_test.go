@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	"go.mau.fi/mautrix-meta/pkg/messagix/cookies"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
+	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory/opaque"
 	"go.mau.fi/mautrix-meta/pkg/messagix/socket"
 	"go.mau.fi/mautrix-meta/pkg/messagix/table"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
@@ -219,11 +221,19 @@ func TestFetchBatchesSpacedAtLeast1s(t *testing.T) {
 	}
 }
 
-// fakePager serves pages of thread tables per sync group.
+// fakePager serves pages of thread tables per sync group. frontier is the oldest activity each group
+// has reached; a served page moves it to the oldest thread row of the page.
 type fakePager struct {
-	mu    sync.Mutex
-	pages map[int64][]*table.LSTable
-	calls []int64
+	mu       sync.Mutex
+	pages    map[int64][]*table.LSTable
+	frontier map[int64]int64
+	calls    []int64
+}
+
+func (p *fakePager) Frontier(group int64) (int64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.frontier[group], len(p.pages[group]) > 0
 }
 
 func (p *fakePager) FetchThreadPage(_ context.Context, group int64, handle func(*table.LSTable)) (bool, error) {
@@ -237,6 +247,12 @@ func (p *fakePager) FetchThreadPage(_ context.Context, group int64, handle func(
 	page := pages[0]
 	p.pages[group] = pages[1:]
 	more := len(p.pages[group]) > 0
+	for _, t := range page.LSDeleteThenInsertThread {
+		p.frontier[group] = min(p.frontier[group], t.LastActivityTimestampMs)
+	}
+	for _, t := range page.LSVerifyHybridThreadExists {
+		p.frontier[group] = min(p.frontier[group], t.LastActivityTimestampMS)
+	}
 	p.mu.Unlock()
 	handle(page)
 	return more, nil
@@ -257,7 +273,7 @@ func TestFetchConversationsPaging(t *testing.T) {
 		95: {
 			{LSVerifyHybridThreadExists: []*table.LSVerifyHybridThreadExists{{ThreadKey: hybridKey, ThreadJID: 303, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, LastActivityTimestampMS: 700}}},
 		},
-	}}
+	}, frontier: map[int64]int64{1: 1000, 95: 750}}
 	b.pagerOverride = pager
 	call := func(cursor *string) ([]string, bool, string) {
 		var convs []string
@@ -288,6 +304,46 @@ func TestFetchConversationsPaging(t *testing.T) {
 	defer pager.mu.Unlock()
 	if len(pager.calls) != 3 || pager.calls[0] != 1 || pager.calls[1] != 1 || pager.calls[2] != 95 {
 		t.Fatalf("calls = %v", pager.calls)
+	}
+}
+
+// TestFetchConversationsMergesGroupsByActivity: the E2EE list is paged as soon as it reaches more
+// recent activity than the normal list, instead of after the normal list ends (seen live: E2EE chats
+// older than the startup pages never appeared while years of normal threads did).
+func TestFetchConversationsMergesGroupsByActivity(t *testing.T) {
+	b, _, _, _ := newSendBackend(t)
+	b.pagingDelay = time.Millisecond
+	hybrid := func(key, peer, ts int64) *table.LSTable {
+		return &table.LSTable{LSVerifyHybridThreadExists: []*table.LSVerifyHybridThreadExists{{ThreadKey: key, ThreadJID: peer, ThreadType: table.ENCRYPTED_OVER_WA_ONE_TO_ONE, LastActivityTimestampMS: ts}}}
+	}
+	pager := &fakePager{pages: map[int64][]*table.LSTable{
+		1: {
+			{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{threadRow(301, table.ONE_TO_ONE, 900)}},
+			{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{threadRow(302, table.ONE_TO_ONE, 500)}},
+			{LSDeleteThenInsertThread: []*table.LSDeleteThenInsertThread{threadRow(305, table.ONE_TO_ONE, 100)}},
+		},
+		95: {hybrid(7001, 303, 800), hybrid(7002, 304, 400)},
+	}, frontier: map[int64]int64{1: 1000, 95: 950}}
+	b.pagerOverride = pager
+	var cursor *string
+	var order []string
+	for page := 0; page < 10; page++ {
+		raw, err := b.fetchConversations(context.Background(), FetchConversationsArgs{Cursor: cursor}, func(e Event) {
+			if e.Type == EventConversationUpsert {
+				order = append(order, e.Data.(Conversation).ID)
+			}
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		more, next, _ := fetchData(t, raw)
+		if !more {
+			break
+		}
+		cursor = &next
+	}
+	if got := strings.Join(order, ","); got != "u:301,u:303,u:302,u:304,u:305" {
+		t.Fatalf("order = %s", got)
 	}
 }
 
@@ -544,6 +600,101 @@ func TestFetchE2EEIncludesSameTimestampWithoutDuplicates(t *testing.T) {
 	}
 }
 
+// TestFetchPagesBothThreadsByTime: a conversation with a normal and an E2EE thread pages whichever
+// thread is at the more recent position, so one page never holds old normal messages above E2EE
+// messages that were not fetched yet (seen live: page 1 went back to 2024 in the normal thread while
+// the E2EE thread was still in 2026). count reports the emitted messages.
+func TestFetchPagesBothThreadsByTime(t *testing.T) {
+	b, _, ls := newHistoryBackend(t)
+	b.pagingDelay = time.Millisecond
+	b.index.ApplyTable(&table.LSTable{LSCreateOpenToE2EEThreadLink: []*table.LSCreateOpenToE2EEThreadLink{
+		{OpenThreadID: testPeer, ArmadilloThreadID: testPeer},
+	}}, func(Event) {})
+	b.history.setDevice(testHistoryDevice())
+	peer := strconv.FormatInt(testPeer, 10)
+	no, yes := false, true
+	b.historyOverride = &fakeHistory{fetch: func(ts int64, _ int) (*securehistory.MessageRange, error) {
+		if ts > 200_001 {
+			return &securehistory.MessageRange{Messages: []*securehistory.ArchiveMessage{
+				archived(t, "wa-3", peer, "c", 300_000), archived(t, "wa-2", peer, "b", 200_000),
+			}, Range: &securehistory.MessageRangeInfo{HasMoreBefore: &yes, HasMoreAfter: &no, Before: 199_999}}, nil
+		}
+		return &securehistory.MessageRange{Messages: []*securehistory.ArchiveMessage{archived(t, "wa-1", peer, "a", 70_000)},
+			Range: &securehistory.MessageRangeInfo{HasMoreBefore: &no, HasMoreAfter: &yes}}, nil
+	}}
+	ls.execute = func(_ context.Context, tasks []socket.Task) (*table.LSTable, error) {
+		if f := tasks[0].(*socket.FetchMessagesTask); f.ReferenceMessageId == "m-100" {
+			return lsHistory(testPeer, true, [2]int64{50, 50_000}, [2]int64{49, 49_000}), nil
+		}
+		return lsHistory(testPeer, false, [2]int64{48, 48_000}), nil
+	}
+	conv := conversationID(testSelf, testPeer)
+	events, raw := runFetch(t, b, FetchMessagesArgs{ConversationID: conv, Limit: 2})
+	more, cursor, data := fetchData(t, raw)
+	if ids := strings.Join(messageIDs(events), ","); ids != "wa-3,wa-2" || !more || data["count"] != float64(2) {
+		t.Fatalf("page 1 = %s more=%v data=%v", ids, more, data)
+	}
+	events, raw = runFetch(t, b, FetchMessagesArgs{ConversationID: conv, Cursor: &cursor, Limit: 2})
+	more, cursor, data = fetchData(t, raw)
+	if ids := strings.Join(messageIDs(events), ","); ids != "wa-1,m-50,m-49" || !more || data["count"] != float64(3) {
+		t.Fatalf("page 2 = %s more=%v data=%v", ids, more, data)
+	}
+	events, raw = runFetch(t, b, FetchMessagesArgs{ConversationID: conv, Cursor: &cursor, Limit: 2})
+	more, _, data = fetchData(t, raw)
+	if ids := strings.Join(messageIDs(events), ","); ids != "m-48" || more || data["count"] != float64(1) {
+		t.Fatalf("page 3 = %s more=%v data=%v", ids, more, data)
+	}
+}
+
+// TestFetchHoldsBackMessagesBehindOtherThread: in a chat moved to E2EE, the normal thread (no message
+// in memory) answers with its last messages from long ago. They are held back until the E2EE thread
+// has paged down to them, then come again from the anchor message.
+func TestFetchHoldsBackMessagesBehindOtherThread(t *testing.T) {
+	b, _, ls, _ := newSendBackend(t)
+	b.pagingDelay = time.Millisecond
+	b.index.ApplyTable(&table.LSTable{LSCreateOpenToE2EEThreadLink: []*table.LSCreateOpenToE2EEThreadLink{
+		{OpenThreadID: testPeer, ArmadilloThreadID: testPeer},
+	}}, func(Event) {})
+	b.history.setDevice(testHistoryDevice())
+	peer := strconv.FormatInt(testPeer, 10)
+	no, yes := false, true
+	b.historyOverride = &fakeHistory{fetch: func(ts int64, _ int) (*securehistory.MessageRange, error) {
+		if ts > 200_001 {
+			return &securehistory.MessageRange{Messages: []*securehistory.ArchiveMessage{
+				archived(t, "wa-3", peer, "c", 300_000), archived(t, "wa-2", peer, "b", 200_000),
+			}, Range: &securehistory.MessageRangeInfo{HasMoreBefore: &yes, HasMoreAfter: &no, Before: 199_999}}, nil
+		}
+		return &securehistory.MessageRange{Messages: []*securehistory.ArchiveMessage{archived(t, "wa-1", peer, "a", 70_000)},
+			Range: &securehistory.MessageRangeInfo{HasMoreBefore: &no, HasMoreAfter: &yes}}, nil
+	}}
+	var refs []string
+	ls.execute = func(_ context.Context, tasks []socket.Task) (*table.LSTable, error) {
+		switch task := tasks[0].(type) {
+		case *socket.CreateThreadTask:
+			refs = append(refs, "create")
+			return lsHistory(testPeer, true, [2]int64{50, 50_000}, [2]int64{49, 49_000}), nil
+		case *socket.FetchMessagesTask:
+			refs = append(refs, task.ReferenceMessageId)
+			return lsHistory(testPeer, false, [2]int64{50, 50_000}, [2]int64{49, 49_000}, [2]int64{48, 48_000}), nil
+		}
+		return &table.LSTable{}, nil
+	}
+	conv := conversationID(testSelf, testPeer)
+	events, raw := runFetch(t, b, FetchMessagesArgs{ConversationID: conv, Limit: 2})
+	more, cursor, data := fetchData(t, raw)
+	if ids := strings.Join(messageIDs(events), ","); ids != "wa-3,wa-2" || !more || data["count"] != float64(2) {
+		t.Fatalf("page 1 = %s more=%v data=%v", ids, more, data)
+	}
+	events, raw = runFetch(t, b, FetchMessagesArgs{ConversationID: conv, Cursor: &cursor, Limit: 2})
+	more, _, data = fetchData(t, raw)
+	if ids := strings.Join(messageIDs(events), ","); ids != "wa-1,m-50,m-49,m-48" || more || data["count"] != float64(4) {
+		t.Fatalf("page 2 = %s more=%v data=%v", ids, more, data)
+	}
+	if strings.Join(refs, ",") != "create,m-50" {
+		t.Fatalf("normal thread requests = %v", refs)
+	}
+}
+
 func TestHistorySecretAccountAndValidation(t *testing.T) {
 	dev := testHistoryDevice()
 	event, err := deviceSecret(dev, 1)
@@ -570,6 +721,7 @@ func TestRestoreFailureReasons(t *testing.T) {
 	}{
 		{&securehistory.RecoveryError{AttemptsRemaining: &zero}, "locked"},
 		{&securehistory.RecoveryError{}, "wrong_pin"},
+		{fmt.Errorf("recover: %w", opaque.ErrInvalidPIN), "wrong_pin"},
 		{types.ErrPleaseLogIn, "auth_required"},
 		{httpclient.ErrTokenInvalidated, "auth_required"},
 	} {

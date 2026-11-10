@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-meta/pkg/messagix/httpclient"
 	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory"
+	"go.mau.fi/mautrix-meta/pkg/messagix/securehistory/opaque"
 	"go.mau.fi/mautrix-meta/pkg/messagix/types"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waArmadilloBackupMessage"
@@ -309,6 +310,9 @@ func restoreFailure(err error) (string, *int) {
 			return "locked", recovery.AttemptsRemaining
 		}
 		return "wrong_pin", recovery.AttemptsRemaining
+	case errors.Is(err, opaque.ErrInvalidPIN):
+		// The OPAQUE exchange rejects a wrong PIN on this side, without an attempt count.
+		return "wrong_pin", nil
 	default:
 		return "other", nil
 	}

@@ -80,6 +80,10 @@ public final class AppState {
     @ObservationIgnored private var sessionGeneration = UUID()
     @ObservationIgnored private var historyGeneration = UUID()
     @ObservationIgnored private var lastOlderAt: [String: ContinuousClock.Instant] = [:]
+    /// Số `message_upsert` đã hợp nhất cho hội thoại đang `loadOlder` (chỉ có key khi đang tải).
+    @ObservationIgnored private var olderArrivals: [String: Int] = [:]
+    /// Thời gian tối đa chờ tin của một batch `loadOlder` hợp nhất xong sau khi có response.
+    static let olderArrivalTimeout: Duration = .seconds(3)
     @ObservationIgnored private var observers: [UUID: AsyncStream<CoreEvent>.Continuation] = [:]
     /// Task của lệnh gần nhất (test dùng để chờ).
     @ObservationIgnored var lastCall: Task<Void, Never>?
@@ -404,6 +408,7 @@ public final class AppState {
         olderError[conversationID] = nil
         let previousIDs = Set(messages(for: conversationID).map(\.id))
         loadingOlder.insert(conversationID)
+        olderArrivals[conversationID] = 0
         let generation = sessionGeneration
         let history = historyGeneration
         lastCall = Task {
@@ -415,6 +420,18 @@ public final class AppState {
             let resp = try? await link.call(.fetchMessages(conversationID: conversationID,
                                                          cursor: messageCursors[conversationID], limit: 30))
             guard generation == sessionGeneration else { return }
+            // Response đến qua continuation, còn message_upsert của batch đi qua luồng events và có thể chưa
+            // hợp nhất xong: chờ đủ `count` tin (có hạn) rồi mới kết thúc batch.
+            var count: Int?
+            if let resp, resp.ok, case .object(let data)? = resp.data, case .int(let n)? = data["count"] { count = Int(n) }
+            if let count, count > 0 {
+                let deadline = ContinuousClock.now + Self.olderArrivalTimeout
+                while (olderArrivals[conversationID] ?? 0) < count, ContinuousClock.now < deadline {
+                    try? await Task.sleep(for: .milliseconds(20))
+                    guard generation == sessionGeneration else { return }
+                }
+            }
+            olderArrivals[conversationID] = nil
             loadingOlder.remove(conversationID)
             // Một batch đang chạy khi restore xong không được ghi lại cursor cũ.
             guard history == historyGeneration else {
@@ -440,8 +457,10 @@ public final class AppState {
                 olderError[conversationID] = error
                 lastError = error
             }
-            if !exhausted.contains(conversationID),
-               olderError[conversationID] != nil || Set(messages(for: conversationID).map(\.id)).subtracting(previousIDs).isEmpty {
+            // Lõi báo `count`: 0 tin mới thì tạm dừng. Lõi cũ không có `count`: so cache như trước.
+            let noNewMessages = count.map { $0 == 0 }
+                ?? Set(messages(for: conversationID).map(\.id)).subtracting(previousIDs).isEmpty
+            if !exhausted.contains(conversationID), olderError[conversationID] != nil || noNewMessages {
                 olderPaused.insert(conversationID)
                 olderRetryAt[conversationID] = .now
             }
@@ -547,6 +566,7 @@ public final class AppState {
             }
             knownTS[m.conversationID] = max(knownTS[m.conversationID] ?? 0, m.ts)
             if let store, let change = try? await store.upsert(m) { patch(change) }
+            if let n = olderArrivals[m.conversationID] { olderArrivals[m.conversationID] = n + 1 }
         case .messageSendResult(let r):
             let status = MessageStatus(rawValue: r.status) ?? .unknown
             await setStatus(clientID: r.clientID, status: status, messageID: status == .sent ? r.messageID : nil)
@@ -686,5 +706,6 @@ public final class AppState {
         olderRetryAt = [:]
         loadingOlder = []
         lastOlderAt = [:]
+        olderArrivals = [:]
     }
 }

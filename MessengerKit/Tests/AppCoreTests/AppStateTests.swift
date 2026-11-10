@@ -53,6 +53,35 @@ struct AppStateTests {
         #expect(await link.commands.last == .fetchMessages(conversationID: "u:1", cursor: nil, limit: 30))
     }
 
+    /// Với lõi thật, response của fetch_messages về trước khi các message_upsert của batch hợp nhất xong
+    /// (hai đường khác nhau). Batch phải chờ đủ `count` tin, và chỉ tạm dừng khi lõi báo 0 tin.
+    @Test func testOlderWaitsForLateMessagesAndPausesOnlyOnZeroCount() async throws {
+        let (state, link, _) = try await loggedInState()
+        await state.open(conversationID: "u:2")
+        await link.enqueue(CoreResponse(ok: true, data: .object([
+            "has_more": .bool(true), "cursor": .string("c1"), "count": .int(2),
+        ])))
+        state.loadOlder(conversationID: "u:2")
+        let batch = state.lastCall
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(state.loadingOlder.contains("u:2"))
+        for (id, ts) in [("old-1", 10), ("old-2", 20)] {
+            await state.apply(.messageUpsert(Message(id: id, conversationID: "u:2", threadID: "u:2",
+                                                   senderID: "2", isOutgoing: false, ts: Int64(ts), text: id)))
+        }
+        await batch?.value
+        #expect(!state.loadingOlder.contains("u:2"))
+        #expect(!state.olderPaused.contains("u:2"))
+        #expect(state.messages(for: "u:2").map(\.id) == ["old-1", "old-2"])
+
+        await link.enqueue(CoreResponse(ok: true, data: .object([
+            "has_more": .bool(true), "cursor": .string("c2"), "count": .int(0),
+        ])))
+        state.loadOlder(conversationID: "u:2")
+        await state.lastCall?.value
+        #expect(state.olderPaused.contains("u:2"))
+    }
+
     @Test func testRestoreCanRetryAfterSkipAndFailure() async throws {
         let (state, link, keychain) = try await loggedInState()
         state.skipHistoryRestore()

@@ -31,7 +31,15 @@ func main() {
 	sendFile := flag.String("send-file", "", "conversation_id; sends the file named by the first remaining argument")
 	download := flag.String("download", "", "attachment ref; writes it to the path named by the first remaining argument")
 	settle := flag.Duration("settle", 15*time.Second, "wait after connecting before running an action (E2EE and thread list)")
+	secretsFile := flag.String("secrets-file", "", "file holding the secure_history_device secret (passed in login.secrets)")
+	// Probe mode: prints only counts, timestamps and flags to stderr, never names, text or secrets.
+	fetchConvs := flag.Int("fetch-conversations", 0, "probe: page fetch_conversations up to N times")
+	fetchMsgs := flag.String("fetch-messages", "", "probe: comma-separated conversation_ids to page with fetch_messages")
+	pages := flag.Int("pages", 5, "probe: fetch_messages pages per conversation")
+	limit := flag.Int("limit", 30, "probe: fetch_messages limit")
+	listConvs := flag.Bool("list-conversations", false, "probe: print the conversation summary (ids, counts) at the end")
 	flag.Parse()
+	probing := *fetchConvs > 0 || *fetchMsgs != "" || *listConvs
 	action, err := actionRequest(*sendText, *sendFile, *download, flag.Args())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -42,17 +50,46 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	var values map[string]string
-	if err = json.Unmarshal(raw, &values); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	// Either {"name": "value"} or the [{"name","value","domain"}] list the app keeps in the Keychain.
+	var list []engine.Cookie
+	if err = json.Unmarshal(raw, &list); err != nil {
+		var values map[string]string
+		if err = json.Unmarshal(raw, &values); err != nil {
+			fmt.Fprintln(os.Stderr, "invalid cookie file")
+			os.Exit(1)
+		}
+		for name, value := range values {
+			list = append(list, engine.Cookie{Name: name, Value: value})
+		}
+	}
+	var secrets map[string]string
+	if *secretsFile != "" {
+		secret, err := os.ReadFile(*secretsFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "cannot read secrets file")
+			os.Exit(1)
+		}
+		secrets = map[string]string{engine.SecretSecureHistoryDevice: strings.TrimSpace(string(secret))}
 	}
 	connected := make(chan struct{}, 1)
-	list := make([]engine.Cookie, 0, len(values))
-	for name, value := range values {
-		list = append(list, engine.Cookie{Name: name, Value: value})
-	}
+	probe := newProber()
 	e := engine.New(engine.Config{DataDir: *data, Backend: "meta"}, func(event engine.Event) {
+		if probing {
+			if s, ok := event.Data.(engine.ConnectionState); ok && s.State == "connected" {
+				select {
+				case connected <- struct{}{}:
+				default:
+				}
+			}
+			if probe.observe(event) {
+				return
+			}
+			// Everything else is printed below with the usual redaction; secret values never are.
+			if event.Type == engine.EventSecretStore {
+				fmt.Fprintln(os.Stderr, "event secret_store (value not shown)")
+				return
+			}
+		}
 		if s, ok := event.Data.(engine.ConnectionState); ok && s.State == "connected" {
 			select {
 			case connected <- struct{}{}:
@@ -94,12 +131,42 @@ func main() {
 		}
 	})
 	defer e.Shutdown()
-	req, _ := json.Marshal(map[string]any{"cmd": "login", "args": engine.LoginArgs{Cookies: list, Platform: *platform}})
+	probe.e = e
+	req, _ := json.Marshal(map[string]any{"cmd": "login", "args": engine.LoginArgs{Cookies: list, Platform: *platform, Secrets: secrets}})
 	e.Call(req)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sig)
 	end := time.After(*duration)
+	if probing {
+		select {
+		case <-connected:
+		case <-end:
+			fmt.Fprintln(os.Stderr, "devcli: never connected")
+			return
+		case <-sig:
+			return
+		}
+		select {
+		case <-time.After(*settle):
+		case <-sig:
+			return
+		}
+		total, restored := probe.snapshot()
+		fmt.Fprintf(os.Stderr, "after login+settle: conversations=%d restored=%d\n", total, restored)
+		if *fetchConvs > 0 {
+			probe.fetchConversations(*fetchConvs)
+		}
+		if *fetchMsgs != "" {
+			for _, conv := range strings.Split(*fetchMsgs, ",") {
+				probe.fetchMessages(strings.TrimSpace(conv), *pages, *limit)
+			}
+		}
+		if *listConvs {
+			probe.listConversations()
+		}
+		return
+	}
 	if action != nil {
 		select {
 		case <-connected:
