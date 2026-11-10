@@ -67,6 +67,15 @@ public enum Browser: String, CaseIterable, Sendable {
         }
     }
 
+    public var bundleIdentifier: String {
+        switch self {
+        case .chrome: "com.google.Chrome"
+        case .arc: "company.thebrowser.Browser"
+        case .brave: "com.brave.Browser"
+        case .edge: "com.microsoft.edgemac"
+        }
+    }
+
     public var displayName: String {
         switch self {
         case .chrome: "Chrome"
@@ -96,6 +105,28 @@ public struct BrowserProfile: Equatable, Sendable {
 }
 
 public enum BrowserCatalog {
+    /// false khi có ít nhất một trình duyệt đã cài (thư mục dữ liệu tồn tại) mà `Local State` hoặc `Cookies`
+    /// của profile `Default` không đọc được do bị chặn quyền (EPERM/EACCES, thường là thiếu Full Disk Access).
+    public static func hasDataAccess(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> Bool {
+        let fm = FileManager.default
+        for browser in Browser.allCases {
+            let dataDir = browser.dataDirectory(home: home)
+            // Liệt kê thư mục cũng có thể bị TCC chặn; chỉ coi là "đã cài" khi thấy được thư mục.
+            guard fm.fileExists(atPath: dataDir.path) else { continue }
+            let targets = [
+                dataDir.appendingPathComponent("Local State"),
+                dataDir.appendingPathComponent("Default/Cookies"),
+                dataDir.appendingPathComponent("Default/Network/Cookies"),
+            ]
+            for url in targets where (try? ChromiumCookieReader.checkReadable(url)) == nil {
+                return false
+            }
+        }
+        return true
+    }
+
     /// Profile có file `Cookies`. macOS để ở `<Profile>/Cookies`; giữ fallback `<Profile>/Network/Cookies`.
     /// Không đọc được `Local State` thì vẫn trả profile `Default` nếu có file Cookies.
     public static func installedProfiles(

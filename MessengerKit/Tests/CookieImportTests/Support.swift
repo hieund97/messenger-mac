@@ -103,3 +103,7 @@ func hexData(_ hex: String) -> Data {
         return UInt8(hex[s..<hex.index(s, offsetBy: 2)], radix: 16)!
     })
 }
+
+func setPermissions(_ url: URL, _ mode: Int) throws {
+    try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
+}

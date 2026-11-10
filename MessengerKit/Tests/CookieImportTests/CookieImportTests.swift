@@ -84,4 +84,15 @@ struct CookieImportTests {
             }
         }
     }
+
+    @Test func testUnreadableCookiesFileThrowsPermissionDenied() throws {
+        let (path, _) = try makeTempDB(rows: [
+            (".messenger.com", "c_user", "1"), (".messenger.com", "xs", "2"), (".messenger.com", "datr", "3"),
+        ])
+        try setPermissions(path, 0o000)
+        defer { try? setPermissions(path, 0o600) }
+        #expect(throws: CookieImportError.permissionDenied) {
+            try importer(password: password).importSession(profile(path))
+        }
+    }
 }

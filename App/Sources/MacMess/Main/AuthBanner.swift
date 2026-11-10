@@ -16,6 +16,7 @@ struct AuthBanner: View {
                 }
             }
             Spacer()
+            Button("Mở messenger.com") { BrowserLauncher.openMessenger(in: BrowserLauncher.lastProfile()) }
             Button("Đăng nhập lại") { flow.showPicker = true }
         }
         .padding(10)

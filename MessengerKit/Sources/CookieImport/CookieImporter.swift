@@ -6,6 +6,8 @@ public enum CookieImportError: Error, Equatable, Sendable {
     case keychainDenied
     case keychainUnavailable(Int32)
     case databaseUnreadable
+    /// macOS (TCC) chặn đọc dữ liệu trình duyệt: app thiếu Full Disk Access.
+    case permissionDenied
     /// Thiếu cookie bắt buộc và có cookie bắt buộc không giải mã được (thường do sai key).
     case decryptFailed
 }
@@ -66,6 +68,8 @@ public struct CookieImporter: Sendable {
         let result: ChromiumCookieReader.Result
         do {
             result = try ChromiumCookieReader.read(profile, password: password)
+        } catch CookieImportError.permissionDenied {
+            throw CookieImportError.permissionDenied
         } catch {
             throw CookieImportError.databaseUnreadable
         }

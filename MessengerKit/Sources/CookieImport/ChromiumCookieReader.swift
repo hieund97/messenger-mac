@@ -24,6 +24,7 @@ public enum ChromiumCookieReader {
         let decryptor = try ChromiumDecryptor(password: password)
         let fm = FileManager.default
         cleanStaleTempDirs(fm)
+        try checkReadable(profile.cookiesPath)
 
         for _ in 0..<maxAttempts {
             let tmp = fm.temporaryDirectory.appendingPathComponent("\(tempPrefix)\(UUID().uuidString)", isDirectory: true)
@@ -33,7 +34,12 @@ public enum ChromiumCookieReader {
             let source = profile.cookiesPath
             let before = signature(of: source)
             let copy = tmp.appendingPathComponent("Cookies")
-            try fm.copyItem(at: source, to: copy)
+            do {
+                try fm.copyItem(at: source, to: copy)
+            } catch {
+                if isPermissionError(error) { throw CookieImportError.permissionDenied }
+                throw error
+            }
             for suffix in ["-wal", "-journal", "-shm"] {
                 let side = URL(fileURLWithPath: source.path + suffix)
                 if fm.fileExists(atPath: side.path) {
@@ -53,6 +59,29 @@ public enum ChromiumCookieReader {
             }
         }
         throw CookieImportError.databaseUnreadable
+    }
+
+    /// Ném `.permissionDenied` nếu file tồn tại nhưng mở đọc bị từ chối (EPERM/EACCES). Lỗi khác bỏ qua.
+    static func checkReadable(_ url: URL) throws {
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            try? handle.close()
+        } catch {
+            if isPermissionError(error) { throw CookieImportError.permissionDenied }
+        }
+    }
+
+    /// EPERM/EACCES, hoặc NSFileReadNoPermissionError, kể cả khi nằm trong underlying error.
+    static func isPermissionError(_ error: any Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSPOSIXErrorDomain { return ns.code == Int(EPERM) || ns.code == Int(EACCES) }
+        if ns.domain == NSCocoaErrorDomain {
+            if ns.code == NSFileReadNoPermissionError { return true }
+            if let under = ns.userInfo[NSUnderlyingErrorKey] as? NSError, under.domain == NSPOSIXErrorDomain {
+                return under.code == Int(EPERM) || under.code == Int(EACCES)
+            }
+        }
+        return false
     }
 
     /// Host chấp nhận: `.<domain>`, `<domain>`, `www.<domain>`.
