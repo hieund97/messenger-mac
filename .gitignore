@@ -15,3 +15,7 @@ build/*.dmg
 *.key
 *.p12
 *.bak
+
+# Tài nguyên chỉ dùng trên máy (vd icon riêng), không phát hành
+local/
+logo.svg.webp

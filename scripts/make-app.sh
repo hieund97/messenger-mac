@@ -14,7 +14,11 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks"
 lipo -create "${BINS[@]}" -output "$APP/Contents/MacOS/MacMess"
 cp App/Resources/Info.plist "$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources"
-cp App/Resources/MacMess.icns "$APP/Contents/Resources/MacMess.icns"
+# Icon riêng trên máy (local/MacMess.icns, không vào git) được ưu tiên cho bản tự dùng;
+# bản phát hành (MACMESS_RELEASE=1) luôn dùng icon gốc của repo.
+ICON="App/Resources/MacMess.icns"
+if [[ "${MACMESS_RELEASE:-0}" != 1 && -f local/MacMess.icns ]]; then ICON="local/MacMess.icns"; fi
+cp "$ICON" "$APP/Contents/Resources/MacMess.icns"
 
 # Sparkle.framework (universal) lấy từ artifact SwiftPM; ditto giữ symlink Versions/Current.
 SPARKLE_FW="$(ls -d App/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-*/Sparkle.framework | head -1)"

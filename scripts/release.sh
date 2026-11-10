@@ -53,7 +53,7 @@ fi
 BUILD_NUMBER="$(date +%Y%m%d%H%M)"
 
 # make app (phụ thuộc target core) build bundle từ Info.plist nguồn; version chỉ ghi vào bản build.
-make app
+MACMESS_RELEASE=1 make app
 
 APP="build/MacMess.app"
 # Ghi version vào Info.plist của bản build, sau đó ký lại (make-app.sh chỉ ký ad-hoc tạm nên phải ký lại bundle).
